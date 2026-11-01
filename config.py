@@ -1838,3 +1838,4 @@ V2_VALIDATE_N            = _env_i("V2_VALIDATE_N", 24)             # held-out ti
 V2_EXACT_MASS            = _env_f("V2_EXACT_MASS", 0.999)          # probability put on the solver's digit in EXACT_STATE
 V2_EXHAUSTIVE            = _env_b("V2_EXHAUSTIVE", 0)              # 1 = also run the multi-minute solvers (32-bit LCG brute force, MT19937 elimination)
 V2_HISTORY_TICKS        = _env_i("V2_HISTORY_TICKS", 0)           # >0 and > MH_HISTORY_TICKS: history requested at boot when MH_PRED_V2=1 (paged, 1000 ticks/call; redeploy wipes memory, so this is the only way to reach the 20k / 40k diagnostic rungs early)
+ 
