@@ -326,17 +326,14 @@ class FakeStats:
 
 
 class FakeTarget:
+    """Stands in for target_guard (the cycle gate itself is replaced by Harness.gate; see test_target_guard.py)."""
+    EPS = 1e-9
+
     def __init__(self):
         self.tgt, self.reached, self.suspended = None, False, False
 
-    def target(self):
-        return self.tgt
-
     def is_reached(self):
         return self.reached
-
-    def should_stop(self, bal):
-        return self.tgt is not None and bal >= self.tgt
 
     def mark_reached(self, bal):
         if self.reached:
@@ -344,11 +341,20 @@ class FakeTarget:
         self.reached = True
         return True
 
+    mark_low_balance = mark_reached
+
+    def target_hit(self, bal, start, tp=None):
+        return False
+
+    def target_profit(self):
+        return None
+
+    @staticmethod
+    def money(x, d=2):
+        return round(float(x), d)
+
     def check_seconds(self):
         return 2.0
-
-    def suspend_service(self):
-        self.suspended = True
 
 
 class FakePredictor:
@@ -446,7 +452,13 @@ class Harness:
                 contract_type=lambda c: c[0], true_probability=lambda c: 0.9, Candidate=tuple)))
             st.enter_context(mock.patch.object(bot_engine, "_follower_mgr", None))
             st.enter_context(mock.patch.object(bot_engine, "_follower_db", None))
-            st.enter_context(mock.patch.object(bot_engine, "_redeploy_guard", self.config.get("redeploy_guard")))
+            gate = self.config.get("gate", "go")
+
+            async def _gate(eng, sess, first):
+                if gate == "stop":
+                    self.target.reached = True
+                return gate
+            st.enter_context(mock.patch.object(bot_engine.BotEngine, "_cycle_gate", _gate))
 
             async def _to_thread(fn, *a, **k):
                 return fn(*a, **k)
@@ -665,25 +677,23 @@ class SessionLifecycleTests(unittest.TestCase):
         self.assertTrue(any("WITHOUT A CLOCK SAMPLE" in line for line in cm.output), cm.output)
         self.assertEqual([kw["session_name"] for _, kw in h.live_events()], ["A"])
 
-    def test_hold_preconnect_delays_the_connect(self):
+    def test_cycle_stop_ends_run_and_never_reconnects(self):
         A, _, _ = sched()
-        hold_until = A.connect_ts + 30
-        guard = SimpleNamespace(hold_preconnect=lambda: time.time() < hold_until)
-        h = Harness(A.connect_ts - 5, config={"redeploy_guard": guard}).run(A.open_ts + 10)
-        self.assertGreaterEqual(h.client.ops[0][0], hold_until)
-        self.assertEqual([kw["session_name"] for _, kw in h.live_events()], ["A"])
-
-    def test_target_reached_ends_run_and_never_reconnects(self):
-        A, _, _ = sched()
-        h = Harness(A.connect_ts - 5, target=1000)
+        h = Harness(A.connect_ts - 5, config={"gate": "stop"})            # the cycle gate took over (target / low balance)
         h.client.balance = 1500.0
         h.run(H0 + 7200)
         self.assertTrue(h.engine_ended)
         self.assertIsNone(h.engine_task.exception())
         self.assertEqual(h.client.connect_calls, 1)
-        self.assertTrue(h.target.suspended)
         self.assertEqual(h.client.sent_buys, [])
-        self.assertLess(h.client.ops[-1][0], A.open_ts)                     # nothing after the target shutdown
+        self.assertLess(h.client.ops[-1][0], A.open_ts)                     # nothing after the stop
+
+    def test_cycle_skip_does_not_trade_the_session_and_retries_the_next(self):
+        A, B, _ = sched()
+        h = Harness(A.connect_ts - 5, config={"gate": "skip"}).run(B.open_ts + 10)
+        self.assertEqual(h.client.sent_buys, [])
+        self.assertEqual(h.live_events(), [])
+        self.assertGreaterEqual(h.client.connect_calls, 2)                  # session A and B both connected (and re-judged)
 
     def test_drain_is_bounded_and_unsettled_contracts_are_left_to_deriv(self):
         A, _, _ = sched()

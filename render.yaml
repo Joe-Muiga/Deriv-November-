@@ -2,9 +2,9 @@
 #
 # Required per service:
 #   DERIV_API_TOKEN  – Deriv API token (trade + read scope)
-#   RENDER_API_KEY   – Render API key. STILL REQUIRED: the single pre-Session-A redeploy (below) and the TARGET_BALANCE
-#                      suspend both call the Render API with it. Without it the redeploy is skipped (logged) and the
-#                      bot keeps running on the instance it has.
+#   RENDER_API_KEY   – Render API key. REQUIRED for the profit cycle: it saves / clears the cycle's starting balance
+#                      (CYCLE_STARTING_BALANCE), redeploys after a profit-target cycle and suspends on low balance.
+#                      Without it the bot cannot start a cycle: it logs CRITICAL, shows it on the dashboard and does not trade.
 # Optional (all have defaults, see CHANGES.md):
 #   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default R_100),
 #   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
@@ -23,8 +23,9 @@
 #   disconnect/reconnect, never a redeploy. Models refit in-process inside every lead except the first one after a fresh
 #   process start (that one runs the normal boot fit). A process that BOOTS inside a session waits for the next open
 #   (RESUME_TRADING_MID_SESSION_AFTER_BOOT=0 default).
-#   The old rolling auto-redeploy, the 29-36 minute window and every REDEPLOY_* / AUTO_REDEPLOY* / SESSION_WINDOW_ENABLED
-#   env var are GONE: if any is still set on this service it is ignored and one WARNING at boot lists it. Delete them.
+#   There is NO time-based redeploy: the only reason this service redeploys is a completed profit-target cycle (below).
+#   Old REDEPLOY_* / AUTO_REDEPLOY* / PRE_A_REDEPLOY_* / PRE_SESSION_REDEPLOY_* / SESSION_WINDOW_ENABLED / TARGET_BALANCE /
+#   PROFIT_CYCLE_* env vars are IGNORED: if any is still set on this service one WARNING at boot lists it. Delete them.
 #
 #   Tunables (env vars, defaults in brackets; all live in config.py):
 #     WINDOW_PRECONNECT_SECONDS (120)  – the connect lead: how long before a session opens the bot connects. It must cover
@@ -36,32 +37,25 @@
 #     SESSION_SCHEDULE_ENABLED (1)     – dev override only. 0 disables the schedule (always connected, always buying) and is
 #         logged CRITICAL at boot. Leave it unset on Render.
 #
-# ── THE PRE-SESSION REDEPLOYS (before A AND before B, build cache cleared) ───────────────────────────────────
-#   One redeploy before EACH session, i.e. two per hour. The running instance fires each one while it is idle in the gap
-#   after the previous session, timed so the new instance is up just BEFORE the next connect lead:
-#       before A: gap about HH:29:11 to HH:03:00 (~34 min)    before B: gap about HH:12:11 to HH:22:00 (~10 min)
-#       fire time = (next connect lead) - (expected deploy duration + safety margin)
-#   With the defaults that is about HH:55:00 for A and HH:14:00 for B (240 s + 240 s = 8 min before the connect lead); the
-#   expected duration becomes the rolling P95 of recent Render deploy durations once at least 3 are known. NEVER inside a
-#   session, a lead or a drain. If it does not fit in the gap (the A-to-B gap is the tight one: ~9.5 min usable), preflight
-#   refuses (a failed / still-building deploy, /health not ok, backoff active), the kill switch is on or the target balance is
-#   reached, that session is skipped with a WARNING and shown on the dashboard; nothing is retried after the connect lead.
-#   The request is {"clearCache": "clear"}: this needs RENDER_API_KEY + RENDER_SERVICE_ID (a deploy hook cannot clear the
-#   cache, so with no API key NO redeploy happens and a CRITICAL line is logged at boot).
-#   While a fired deploy is replacing the old instance, the old instance holds its connect lead.
-#     PRE_SESSION_REDEPLOY_CLEAR_CACHE (1)            – 1 = clearCache "clear" (needs the API key); 0 = "do_not_clear"
-#     PRE_A_REDEPLOY_ENABLED (1)                      – 0 = never redeploy (the bot just keeps running); applies to A and B
-#     PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS (240)   – expected deploy time until Render deploy history exists
-#     PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS (240)      – extra time added before the connect lead
-#     PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS (15)  – earliest fire = previous session's drain end + this
-#     PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS (180)     – a deploy still not live this long after expected = stalled
-#     PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS (60), PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS (1800) – backoff after a failed deploy
-#   Deploy durations are read from Render (GET /v1/services/{id}/deploys), not stored in an env var.
-
-#   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
-#     is >= this, the bot stops trading (open trades or not), closes the Deriv connection and
-#     SUSPENDS this Render service. Needs RENDER_API_KEY (below) for the suspend step.
-#     TARGET_CHECK_SECONDS (3) = how often the balance is also polled directly.
+# ── THE PROFIT CYCLE (never-ending; see README.md) ─────────────────────────────────────────────────────────────
+#   1. start : connected + Deriv portfolio flat -> the live balance is saved as CYCLE_STARTING_BALANCE (via the Render API).
+#   2. trade : net profit = live balance - starting balance; target balance = starting balance + TARGET_PROFIT.
+#   3. target: net profit >= TARGET_PROFIT -> no new proposals/buys -> drain open contracts (CYCLE_DRAIN_TIMEOUT_SECONDS) ->
+#              CYCLE_COUNT / CYCLE_LIFETIME_PROFIT -> CLEAR CYCLE_STARTING_BALANCE and verify it -> (CYCLE_COOLDOWN_SECONDS)
+#              -> redeploy -> the fresh process starts the next cycle. No verified clear = no redeploy (retry with backoff).
+#   4. low   : balance < the minimum stake (PREDICTOR_STAKE) with Deriv's portfolio flat -> stop -> clear (verified) -> SUSPEND.
+#              Resume: top up the account, then Resume the service in Render (a fresh cycle starts).
+#
+#   TARGET_PROFIT  - SET BY HAND in Render -> Environment; the bot only READS it, it never writes, clears or resets it.
+#                    Absolute profit per cycle in account currency (50 = stop the cycle at +50). Unset / 0 = profit target OFF
+#                    (still records a start and trades, never redeploys on profit; the low-balance suspend still applies).
+#                    Invalid (not a number, negative, below 0.01) = ERROR logged, target OFF.
+#                    Changing it mid-cycle keeps the saved start; the running process sees it after a restart / deploy
+#                    (choose "Save and deploy" / "Save, rebuild, and deploy" when saving; "Save only" does not restart).
+#   CYCLE_STARTING_BALANCE / CYCLE_COUNT / CYCLE_LIFETIME_PROFIT - managed by the bot. Never set by hand (except
+#                    CYCLE_STARTING_BALANCE=0 to force a fresh cycle).
+#   CYCLE_DRAIN_TIMEOUT_SECONDS (900), CYCLE_COOLDOWN_SECONDS (0), TARGET_CHECK_SECONDS (3) - optional.
+#   TARGET_BALANCE is DEPRECATED and ignored (a WARNING is logged while it is set).
 
 # ── Follower accounts (optional; the main account runs the same without them) ─────────────
 #   Set on Render (Environment tab; never put values in this file):
@@ -74,7 +68,7 @@
 #       hour, inclusive: starts 53:00.0, last opening 59:59.9. A test, not a claimed edge.
 #     ZONE_MIN_TRADES (150), ZONE_MAX_PER_HOUR (3), VERDICT_MIN_TRADES (300),
 #     FOLLOWER_LOCK_THRESHOLD (5.0)
-#   (the main account trades on its own; TARGET_BALANCE, if set, still stops it.)
+#   (the main account trades on its own; its profit cycle (TARGET_PROFIT) still applies.)
 #   Demo/real is ONE global switch on the /followers page (typed confirmation), not an env var.
 
 # ── MH recommended env values (Phase 2; code defaults are unchanged, set these on Render to use them) ──
@@ -96,9 +90,9 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
-      - key: RENDER_API_KEY       # still required: the single pre-Session-A redeploy and the TARGET_BALANCE suspend use it
+      - key: RENDER_API_KEY       # required: saves/clears the cycle's starting balance, redeploys on the profit target, suspends on low balance
         sync: false
       - key: PREDICTOR_STAKE      # MINIMUM stake for the main account AND the followers (money rules size up from it)
         sync: false
-      - key: TARGET_BALANCE
+      - key: TARGET_PROFIT        # SET BY HAND (profit per cycle, e.g. 50). The bot only READS it - it never writes or clears it.
         sync: false

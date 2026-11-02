@@ -106,9 +106,9 @@ _state: dict = {
     # separately-labeled key so the two are never conflated again.
     "circuit_breaker_symbols": [],
     # Session / schedule status (contract section 8). Written by the engine, the
-    # lead code and redeploy_guard through update_status(**kw); read by the
+    # lead code and the profit cycle through update_status(**kw); read by the
     # dashboard. The free-text "session" key above stays as the human-readable line.
-    "session_state":         "IDLE",   # IDLE | CONNECTING | WARMING | LIVE | DRAINING | REDEPLOYING
+    "session_state":         "IDLE",   # IDLE | CONNECTING | WARMING | LIVE | DRAINING
     "session_name":          "",       # "A" | "B" | "ALL" | ""  (active or upcoming)
     "session_open_ts":       0.0,      # epoch seconds (Deriv-synced), 0 = unknown
     "session_close_ts":      0.0,
@@ -117,9 +117,21 @@ _state: dict = {
     "session_lead_seconds":  0.0,      # last measured lead length
     "clock_offset":          0.0,
     "clock_error":           0.0,
-    "redeploy_state":        "",       # "" | scheduled | fired | skipped | failed
-    "redeploy_fire_ts":      0.0,      # planned or actual fire time, epoch seconds
-    "redeploy_note":         "",       # short text: why skipped, expected duration
+    # Profit cycle (profit_cycle.dashboard_fields): TARGET_PROFIT is user-owned and shown read-only.
+    "cycle_phase":           "",       # recording | trading | draining | clearing | redeploying | suspended | idle
+    "cycle_message":         "",
+    "cycle_starting_balance": None,
+    "target_profit":         None,
+    "cycle_target_balance":  None,     # starting balance + TARGET_PROFIT
+    "cycle_net_profit":      None,     # live balance - starting balance
+    "min_stake_used":        None,
+    "cycle_count":           0,
+    "lifetime_profit":       0.0,
+    "cycle_alert_persistence_missing": False,
+    "cycle_alert_clear_unverified":    False,
+    "cycle_alert_redeploy_retrying":   False,
+    "cycle_alert_drain_timeout":       False,
+    "cycle_alert_idle_not_suspended":  False,
 }
 
 _status = _state   # alias for bot_engine imports
@@ -133,7 +145,7 @@ def update_status(**kwargs) -> None:
 
 
 def get_state(key, default=None):
-    """Read access to _state (e.g. redeploy_guard reads session_state)."""
+    """Read access to _state."""
     return _state.get(key, default)
 
 
@@ -585,12 +597,12 @@ def _build_hourly_svg(hourly_pnl: dict) -> str:
 import html as _html
 import math as _math
 
-_SESSION_STATES = ("IDLE", "CONNECTING", "WARMING", "LIVE", "DRAINING", "REDEPLOYING")
+_SESSION_STATES = ("IDLE", "CONNECTING", "WARMING", "LIVE", "DRAINING")
 
 # which countdown is meaningful in which state
 _CD_WHEN = {
-    "connect": ("IDLE", "REDEPLOYING"),
-    "open":    ("IDLE", "CONNECTING", "WARMING", "REDEPLOYING"),
+    "connect": ("IDLE",),
+    "open":    ("IDLE", "CONNECTING", "WARMING"),
     "close":   ("LIVE",),
 }
 
@@ -602,15 +614,13 @@ _SESSION_CSS = """
   .sx-warn{background:#3a2a1a;color:var(--yellow);}
   .sx-info{background:#1a2a3a;color:var(--accent);}
   .sx-live{background:#1a3a1f;color:var(--green);}
-  .sx-redeploy{background:#2a1a3a;color:#c084fc;}
   .sx-sub{font-size:12px;color:var(--muted);}
   .sx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;}
   .sx-item{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:8px 10px;}
   .sx-wide{grid-column:1/-1;}
   .sx-val{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;}
   .sx-dim{color:var(--muted);font-weight:400;}
-  .sx-rd-scheduled{color:var(--accent);} .sx-rd-fired{color:#c084fc;}
-  .sx-rd-skipped{color:var(--yellow);}   .sx-rd-failed{color:var(--red);}
+  .sx-alert{color:var(--red);font-weight:700;}
 """
 
 _SESSION_JS = """
@@ -694,8 +704,6 @@ def _session_view(s: dict) -> dict:
         label, cls = "WARMING UP", "sx-info"
     elif state == "DRAINING":
         label, cls = "DRAINING", "sx-warn"
-    elif state == "REDEPLOYING":
-        label, cls = "REDEPLOYING", "sx-redeploy"
     else:
         label, cls = "IDLE - disconnected", "sx-idle"
 
@@ -715,9 +723,6 @@ def _session_view(s: dict) -> dict:
         "lead_s": _num(s.get("session_lead_seconds")),
         "offset": _num(s.get("clock_offset")),
         "error": _num(s.get("clock_error")),
-        "rd_state": str(s.get("redeploy_state") or "").strip().lower(),
-        "rd_ts": _num(s.get("redeploy_fire_ts")),
-        "rd_note": str(s.get("redeploy_note") or "").strip()[:200],
         "old_text": str(s.get("session", "") or ""),
     }
 
@@ -757,22 +762,38 @@ def _render_session_panel(s: dict) -> str:
         name_txt = ("ALL <span class=\"sx-dim\">(always on)</span>" if v["name"] == "ALL"
                     else esc(v["name"]) if v["name"] else '<span class="sx-dim">—</span>')
 
-        # redeploy
-        rs, rd_ts, note = v["rd_state"], v["rd_ts"], v["rd_note"]
-        if not rs:
-            rd_val = '<span class="sx-dim">none planned</span>'
-        elif rs == "scheduled":
-            rd_val = ('<span class="sx-rd-scheduled">scheduled</span>'
-                      + (f' <span class="sx-dim">fires {_fmt_utc(rd_ts)} · in </span>{cd_span(rd_ts)}' if rd_ts > 0 else ""))
-        elif rs == "fired":
-            rd_val = ('<span class="sx-rd-fired">fired</span>'
-                      + (f' <span class="sx-dim">at {_fmt_utc(rd_ts)}</span>' if rd_ts > 0 else ""))
-        elif rs in ("skipped", "failed"):
-            rd_val = (f'<span class="sx-rd-{rs}">{rs}</span>'
-                      + (f' <span class="sx-dim">planned {_fmt_utc(rd_ts)}</span>' if rd_ts > 0 else ""))
-        else:
-            rd_val = esc(rs)
-        rd_item = item("Redeploy", rd_val, esc(note), wide=True)
+        # profit cycle (read-only; TARGET_PROFIT is set by hand on Render)
+        def money_txt(x) -> str:
+            try:
+                return f"{float(x):.2f}"
+            except (TypeError, ValueError):
+                return '<span class="sx-dim">—</span>'
+
+        def signed_txt(x) -> str:
+            try:
+                return f"{float(x):+.2f}"
+            except (TypeError, ValueError):
+                return '<span class="sx-dim">—</span>'
+
+        tp = s.get("target_profit")
+        alert_names = (("cycle_alert_persistence_missing", "PERSISTENCE NOT CONFIGURED (RENDER_API_KEY) - not trading"),
+                       ("cycle_alert_clear_unverified", "starting-balance CLEAR NOT VERIFIED - no redeploy/suspend yet, retrying"),
+                       ("cycle_alert_redeploy_retrying", "redeploy failed - retrying"),
+                       ("cycle_alert_drain_timeout", "drain timed out - continued with contracts still open"),
+                       ("cycle_alert_idle_not_suspended", "service is IDLE and NOT suspended"))
+        alerts = "".join(f'<div class="sx-alert">{esc(t)}</div>' for k, t in alert_names if s.get(k))
+        phase = str(s.get("cycle_phase") or "")
+        rd_item = (
+            item("Cycle phase", esc(phase) if phase else '<span class="sx-dim">—</span>', esc(str(s.get("cycle_message") or "")[:300]))
+            + item("Starting balance", money_txt(s.get("cycle_starting_balance")))
+            + item("TARGET_PROFIT", money_txt(tp) if tp else '<span class="sx-dim">OFF</span>', "set by hand on Render")
+            + item("Target balance", money_txt(s.get("cycle_target_balance")))
+            + item("Net profit", signed_txt(s.get("cycle_net_profit")))
+            + item("Min stake used", money_txt(s.get("min_stake_used")))
+            + item("Cycles done", str(int(s.get("cycle_count") or 0)))
+            + item("Lifetime profit", signed_txt(s.get("lifetime_profit")))
+            + (item("ALERTS", alerts, "", wide=True) if alerts else "")
+        )
 
         offset_txt = f'{v["offset"]:+.3f} s' if (v["offset"] or v["error"]) else "—"
         error_txt  = f'±{v["error"]:.3f} s' if v["error"] > 0 else "—"
@@ -1597,10 +1618,21 @@ def stats_route():
         "streak":             int(s.get("streak", 0)),
         "streak_label":       str(s.get("streak_label", "—")),
         "paused":             bool(s.get("paused_for_loss_limit", False)),
-        "target_balance":     s.get("target_balance"),
+        "target_profit":      s.get("target_profit"),
+        "cycle_phase":        str(s.get("cycle_phase", "")),
+        "cycle_message":      str(s.get("cycle_message", "")),
+        "cycle_starting_balance": s.get("cycle_starting_balance"),
+        "cycle_target_balance":   s.get("cycle_target_balance"),
+        "cycle_net_profit":   s.get("cycle_net_profit"),
+        "min_stake_used":     s.get("min_stake_used"),
+        "cycle_count":        int(s.get("cycle_count") or 0),
+        "lifetime_profit":    s.get("lifetime_profit"),
+        "cycle_alert_persistence_missing": bool(s.get("cycle_alert_persistence_missing", False)),
+        "cycle_alert_clear_unverified":    bool(s.get("cycle_alert_clear_unverified", False)),
+        "cycle_alert_redeploy_retrying":   bool(s.get("cycle_alert_redeploy_retrying", False)),
+        "cycle_alert_drain_timeout":       bool(s.get("cycle_alert_drain_timeout", False)),
+        "cycle_alert_idle_not_suspended":  bool(s.get("cycle_alert_idle_not_suspended", False)),
         "money":              s.get("money"),   # main-account profit floor / stake sizing
-        "target_reached":     bool(s.get("target_reached", False)),
-        "target_reached_balance": s.get("target_reached_balance"),
         "current_symbol":     str(s.get("current_symbol", "—")),
         "session":            str(s.get("session", "—")),
         "session_state":      str(s.get("session_state", "IDLE")),
@@ -1612,9 +1644,6 @@ def stats_route():
         "session_lead_seconds": _num(s.get("session_lead_seconds")),
         "clock_offset":       _num(s.get("clock_offset")),
         "clock_error":        _num(s.get("clock_error")),
-        "redeploy_state":     str(s.get("redeploy_state", "")),
-        "redeploy_fire_ts":   _num(s.get("redeploy_fire_ts")),
-        "redeploy_note":      str(s.get("redeploy_note", "")),
         "server_time":        time.time(),   # bot-host clock now; the page adds clock_offset for countdowns
         "uptime_seconds":     int(s.get("uptime_seconds", 0)),
         "last_signal":        s.get("last_signal", "—"),

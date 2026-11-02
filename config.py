@@ -1613,8 +1613,9 @@ def _env_tuple(k, d):
     return tuple(int(x) for x in raw.split(",") if x.strip())
 
 
-# Render API credentials: the single pre-A redeploy (redeploy_guard.py), the target-balance suspend, and (only if
-# STATS_PERSIST_TO_RENDER=1) persisting stats. RENDER_API_KEY is required for the pre-A redeploy.
+# Render API credentials: the profit cycle (profit_cycle.py: saves / clears the cycle's starting balance, redeploys on the
+# profit target), the low-balance suspend, and (only if STATS_PERSIST_TO_RENDER=1) persisting stats. RENDER_API_KEY is
+# REQUIRED for the cycle to work. TARGET_PROFIT is NOT read here: it is a manual, user-owned variable (target_guard.py).
 RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
@@ -1762,10 +1763,8 @@ STATS_PERSIST_TO_RENDER       = os.environ.get("STATS_PERSIST_TO_RENDER", "0").s
 #    B       | HH:24:00.000      | HH:29:01.000      | open - lead         | close + 10 s = HH:29:11
 #
 #  The bot is connected to Deriv ONLY from the connect lead before a session until the bounded drain after it, and is
-#  fully disconnected in between (no websocket, no authorise/OTP, no polling). The periodic auto-redeploy is gone; one
-#  redeploy runs before EACH session (two per hour, PRE_A_REDEPLOY_* names kept): fired while idle in the gap after the
-#  previous session (after B -> before A, after A -> before B), timed to FINISH just before the next connect lead, with
-#  the build cache CLEARED (clearCache="clear"). Needs RENDER_API_KEY + RENDER_SERVICE_ID (a deploy hook cannot clear).
+#  fully disconnected in between (no websocket, no authorise/OTP, no polling). There is NO time-based redeploy: the only
+#  redeploy is the one after a profit-target cycle (profit_cycle.py).
 SESSION_SCHEDULE_ENABLED     = _env_b("SESSION_SCHEDULE_ENABLED", 1)   # dev override only; 0 is logged CRITICAL at boot; default ON
 SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND = 300, 720                 # plain constants
 SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND = 1440, 1740
@@ -1778,20 +1777,13 @@ SESSION_CLOCK_MIN_INTERVAL   = _env_f("SESSION_CLOCK_MIN_INTERVAL", 0.25) # spac
 SESSION_CLOCK_FLIP_SECONDS   = _env_f("SESSION_CLOCK_FLIP_SECONDS", 4.0)  # rapid sampling to catch the integer-second flip
 SESSION_CLOCK_RESYNC_SECONDS = _env_f("SESSION_CLOCK_RESYNC_SECONDS", 300.0)
 RESUME_TRADING_MID_SESSION_AFTER_BOOT = _env_b("RESUME_TRADING_MID_SESSION_AFTER_BOOT", 0)
-PRE_A_REDEPLOY_ENABLED                  = _env_b("PRE_A_REDEPLOY_ENABLED", 1)
-PRE_SESSION_REDEPLOY_CLEAR_CACHE        = _env_b("PRE_SESSION_REDEPLOY_CLEAR_CACHE", 1)   # 1 = clearCache="clear" on every pre-session deploy
-PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS = _env_f("PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS", 240.0)  # until deploy history exists (a cache-clearing build is slower)
-PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS    = _env_f("PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS", 240.0)
-PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS = _env_f("PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS", 15.0)
-PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS   = _env_f("PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180.0)  # deploy older than expected+this = stalled
-PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS     = _env_f("PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS", 60.0)
-PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS      = _env_f("PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS", 1800.0)
-
-# Old rolling-redeploy / window env vars that are still set on Render. They are IGNORED (they can neither bring the
-# rolling redeploy back nor disable the schedule); main.py logs one WARNING listing them. No new setting uses REDEPLOY_.
+# Env vars of retired features that may still be set on Render. They are IGNORED; main.py logs one WARNING listing them
+# (delete them). TARGET_BALANCE was replaced by TARGET_PROFIT.
 LEGACY_REDEPLOY_ENV_SET = sorted(
     k for k in os.environ
-    if k in ("AUTO_REDEPLOY", "AUTO_REDEPLOY_SECONDS", "SESSION_WINDOW_ENABLED") or k.startswith("REDEPLOY_"))
+    if k in ("AUTO_REDEPLOY", "AUTO_REDEPLOY_SECONDS", "SESSION_WINDOW_ENABLED", "TARGET_BALANCE", "PROFIT_CYCLE_TARGET_PCT",
+             "PROFIT_CYCLE_STARTING_DRAWDOWN_PCT", "PROFIT_CYCLE_COOLDOWN_MINUTES", "CYCLE_PHASE", "CYCLE_COOLDOWN_UNTIL")
+    or k.startswith(("REDEPLOY_", "PRE_A_REDEPLOY_", "PRE_SESSION_REDEPLOY_")))
 
 # ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
 # Primary test: all non-blocklisted symbols, h=1, OVER5 / UNDER4, fixed zone threshold, flat stake, demo only.

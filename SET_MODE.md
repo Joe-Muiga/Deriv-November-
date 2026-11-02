@@ -31,3 +31,6 @@ shortcode) and `SET RESULT` (settling digit, whether it was in the predicted set
 something other than what was bought.
 
 Tests: `python test_set_mode.py` (set mode) and `python test_predictor.py` (original engine).
+
+## Profit cycle
+Set mode runs inside the same never-ending profit cycle as every other mode (see `README.md`): `TARGET_PROFIT` (manual, read-only to the bot) ends a cycle with a drain, a verified clear of the saved starting balance and a redeploy; a balance below the minimum stake (`PREDICTOR_STAKE`) with nothing open clears it and suspends the service. There is no scheduled redeploy.

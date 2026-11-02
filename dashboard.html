@@ -33,7 +33,6 @@
   .sx-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: .85rem; font-weight: 700; letter-spacing: .03em; }
   .sx-idle { background: #21262d; color: #8b949e; } .sx-warn { background: #3a2a1a; color: #d29922; }
   .sx-info { background: #1a2a3a; color: #58a6ff; } .sx-live { background: #1a3a1f; color: #3fb950; }
-  .sx-redeploy { background: #2a1a3a; color: #c084fc; }
   .sx-sub { font-size: .78rem; color: #8b949e; }
   .sx-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
   .sx-item { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 8px 10px; }
@@ -41,7 +40,7 @@
   .sx-wide { grid-column: 1 / -1; }
   .sx-val { font-size: 1rem; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .sx-dim { color: #8b949e; font-weight: 400; }
-  .sx-rd-scheduled { color: #58a6ff; } .sx-rd-fired { color: #c084fc; } .sx-rd-skipped { color: #d29922; } .sx-rd-failed { color: #f85149; }
+  .sx-alert { color: #f85149; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -205,8 +204,8 @@ loadExp(); setInterval(loadExp, 15000);
 // Reads /stats (no PIN). Countdowns use the bot host's clock + clock_offset (Deriv time), advanced with the
 // browser's monotonic clock, so this machine's own clock never matters. If the new keys are missing
 // (older server / engine) the old free-text "session" is shown instead.
-const SX_STATES = ['IDLE', 'CONNECTING', 'WARMING', 'LIVE', 'DRAINING', 'REDEPLOYING'];
-const SX_WHEN = {connect: ['IDLE', 'REDEPLOYING'], open: ['IDLE', 'CONNECTING', 'WARMING', 'REDEPLOYING'], close: ['LIVE']};
+const SX_STATES = ['IDLE', 'CONNECTING', 'WARMING', 'LIVE', 'DRAINING'];
+const SX_WHEN = {connect: ['IDLE'], open: ['IDLE', 'CONNECTING', 'WARMING'], close: ['LIVE']};
 let sxBase = 0, sxT0 = 0;
 const num = v => { const f = Number(v); return Number.isFinite(f) ? f : 0; };
 const esc = t => String(t == null ? '' : t).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
@@ -244,7 +243,6 @@ function renderSession(s) {
   else if (state === 'CONNECTING') { label = 'CONNECTING'; cls = 'sx-warn'; }
   else if (state === 'WARMING') { label = 'WARMING UP'; cls = 'sx-info'; }
   else if (state === 'DRAINING') { label = 'DRAINING'; cls = 'sx-warn'; }
-  else if (state === 'REDEPLOYING') { label = 'REDEPLOYING'; cls = 'sx-redeploy'; }
   else { label = 'IDLE - disconnected'; cls = 'sx-idle'; }
 
   const item = (title, val, sub, wide) => `<div class="sx-item${wide ? ' sx-wide' : ''}"><div class="label">${title}</div>
@@ -261,14 +259,26 @@ function renderSession(s) {
   const stageShown = (state === 'CONNECTING' || state === 'WARMING') && stage;
   const offs = num(s.clock_offset), err = num(s.clock_error), lead = num(s.session_lead_seconds);
 
-  const rs = String(s.redeploy_state || '').trim().toLowerCase(), rts = num(s.redeploy_fire_ts);
-  const note = String(s.redeploy_note || '').trim().slice(0, 200);
-  let rd;
-  if (!rs) rd = '<span class="sx-dim">none planned</span>';
-  else if (rs === 'scheduled') rd = '<span class="sx-rd-scheduled">scheduled</span>' + (rts > 0 ? ` <span class="sx-dim">fires ${fmtUtc(rts)} · in </span>${cdSpan(rts)}` : '');
-  else if (rs === 'fired') rd = '<span class="sx-rd-fired">fired</span>' + (rts > 0 ? ` <span class="sx-dim">at ${fmtUtc(rts)}</span>` : '');
-  else if (rs === 'skipped' || rs === 'failed') rd = `<span class="sx-rd-${rs}">${rs}</span>` + (rts > 0 ? ` <span class="sx-dim">planned ${fmtUtc(rts)}</span>` : '');
-  else rd = esc(rs);
+  // profit cycle (read-only: TARGET_PROFIT is set by hand on Render, nothing here edits it)
+  const money = v => (v == null || v === '' || !Number.isFinite(Number(v))) ? dash : Number(v).toFixed(2);
+  const signed = v => (v == null || !Number.isFinite(Number(v))) ? dash : (Number(v) >= 0 ? '+' : '−') + Math.abs(Number(v)).toFixed(2);
+  const tp = s.target_profit, phase = String(s.cycle_phase || '').toLowerCase();
+  const alerts = [];
+  if (s.cycle_alert_persistence_missing) alerts.push('PERSISTENCE NOT CONFIGURED (RENDER_API_KEY) - not trading');
+  if (s.cycle_alert_clear_unverified) alerts.push('starting-balance CLEAR NOT VERIFIED - no redeploy/suspend yet, retrying');
+  if (s.cycle_alert_redeploy_retrying) alerts.push('redeploy failed - retrying');
+  if (s.cycle_alert_drain_timeout) alerts.push('drain timed out - continued with contracts still open');
+  if (s.cycle_alert_idle_not_suspended) alerts.push('service is IDLE and NOT suspended');
+  const cycleMsg = String(s.cycle_message || '').slice(0, 300);
+  const cyc = item('Cycle phase', phase ? esc(phase) : dash, esc(cycleMsg)) +
+    item('Starting balance', money(s.cycle_starting_balance)) +
+    item('TARGET_PROFIT', tp ? money(tp) : '<span class="sx-dim">OFF</span>', 'set by hand on Render') +
+    item('Target balance', money(s.cycle_target_balance)) +
+    item('Net profit', signed(s.cycle_net_profit)) +
+    item('Min stake used', money(s.min_stake_used)) +
+    item('Cycles done', String(num(s.cycle_count))) +
+    item('Lifetime profit', signed(s.lifetime_profit)) +
+    (alerts.length ? item('ALERTS', alerts.map(a => `<div class="sx-alert">${esc(a)}</div>`).join(''), '', true) : '');
 
   document.getElementById('sx').innerHTML =
     `<div class="sx-head"><span class="sx-badge ${cls}">${esc(label)}</span><span class="sx-sub">${stageShown ? 'stage: ' + esc(stage) : ''}</span></div>
@@ -279,7 +289,7 @@ function renderSession(s) {
     item('Last lead', lead > 0 ? lead.toFixed(1) + ' s' : dash) +
     item('Clock offset', (offs || err) ? (offs >= 0 ? "+" : "−") + Math.abs(offs).toFixed(3) + ' s' : dash) +
     item('Clock error', err > 0 ? '±' + err.toFixed(3) + ' s' : dash) +
-    item('Redeploy', rd, esc(note), true) + '</div>';
+    cyc + '</div>';
 }
 async function loadSession() {
   const tag = document.getElementById('sx-upd');

@@ -30,14 +30,10 @@ import config
 import predictor as pred
 import main_money
 import predictor_stats
+import profit_cycle
 import target_guard
 import window_scheduler as ws
 from deriv_client import DerivClient
-
-try:                                    # the single pre-A redeploy guard; a missing module never holds the connect
-    import redeploy_guard as _redeploy_guard
-except Exception:                       # pragma: no cover
-    _redeploy_guard = None
 
 try:                                    # follower system is optional; the main account never depends on it
     import db as _follower_db
@@ -53,16 +49,6 @@ logger = logging.getLogger(__name__)
 
 def _cfg(name, default):
     return getattr(config, name, default)
-
-
-def _hold_preconnect() -> bool:
-    """redeploy_guard.hold_preconnect(); False if the module is missing or raises."""
-    if _redeploy_guard is None:
-        return False
-    try:
-        return bool(_redeploy_guard.hold_preconnect())
-    except Exception:
-        return False
 
 
 def _ts_or_zero(x) -> float:
@@ -90,11 +76,14 @@ class BotEngine:
         self._ratios: Dict[str, Dict[pred.Candidate, float]] = {}
         self._recent_epochs: Dict[str, List[float]] = {}
         self._last_epoch: Dict[str, float] = {}
-        self._lag_obs: List[int] = []
+        self._lag_obs: collections.deque = collections.deque(maxlen=500)
         self._last_decision = "—"
         self.balance = 0.0
-        self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
-        self._session_over = False            # session closed: no buys until the next session starts
+        self._target_done = asyncio.Event()   # set once the cycle's terminal flow (redeploy / suspend / idle) has finished
+        self._drain_finished = asyncio.Event()  # set once the terminal flow's drain of open contracts is over (or it ended)
+        self._terminal_task: Optional[asyncio.Task] = None   # the one running target-hit / low-balance flow
+        self._deriv_open = 0                  # open contracts in Deriv's own portfolio at the last check
+        self._session_over = False           # session closed: no buys until the next session starts
         self.session: Optional[ws.Session] = None   # the active session (None while IDLE)
         self._booted = False                  # True once the boot fit (_init_symbols) has succeeded in this process
         self._last_drain_end = 0.0            # drain_end_ts of the last session we handled (never repeat a session)
@@ -125,7 +114,21 @@ class BotEngine:
     # ── lifecycle: the session loop (contract section 4) ─────────────────────
     async def run(self):
         """IDLE -> CONNECTING -> WARMING -> LIVE -> DRAINING -> IDLE, once per session, forever. Returns only
-        when the balance target is reached; a crash propagates so main.py rebuilds the engine."""
+        when the cycle ended (profit target -> redeploy, or low balance -> suspend) and that flow has finished;
+        a crash propagates (after the flow was let finish) so main.py rebuilds the engine."""
+        try:
+            await self._run_sessions()
+        finally:
+            await self._await_terminal()
+
+    async def _await_terminal(self):
+        """Wait for the running target-hit / low-balance flow (clear -> redeploy / suspend): it must outlive the session
+        loop, or the process would sit stopped with the starting balance never cleared."""
+        task = self._terminal_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
+
+    async def _run_sessions(self):
         logger.info("=" * 64)
         logger.info("  Digit predictor bot  –  min stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
         logger.info("=" * 64)
@@ -135,7 +138,7 @@ class BotEngine:
         first_pass = True
         while True:
             if target_guard.is_reached() or self._target_done.is_set():
-                return                                      # target already reached: never connect again
+                return                                      # cycle already ended: never connect again
             if scheduled and not ws.schedule_ok():
                 logger.critical("SESSION SCHEDULE INCONSISTENT (ws.schedule_ok() is False): failing closed, "
                                 "no connection")
@@ -166,19 +169,8 @@ class BotEngine:
         return sess
 
     async def _wait_for_lead(self, sess: "ws.Session") -> bool:
-        """IDLE: sleep (no socket, no Deriv traffic) until connect_ts; honour redeploy_guard.hold_preconnect()."""
+        """IDLE: sleep (no socket, no Deriv traffic) until connect_ts."""
         await self._sleep_until(sess.connect_ts)
-        warned = 0.0
-        while _hold_preconnect():
-            if ws.now() >= sess.close_ts:
-                logger.critical("SESSION %s MISSED: redeploy_guard held the connection until after the close",
-                                sess.name)
-                self._last_drain_end = max(self._last_drain_end, sess.drain_end_ts)
-                return False
-            if time.time() - warned >= 30:
-                warned = time.time()
-                logger.warning("SESSION %s: connect held by redeploy_guard (deploy in flight)", sess.name)
-            await asyncio.sleep(1.0)
         return True
 
     async def _sleep_until(self, ts: float, watch: Optional[list] = None, connected: bool = False) -> Optional[str]:
@@ -250,10 +242,13 @@ class BotEngine:
                 return False                                # session ran out before we could connect
             self.balance = self.client.balance
             first = not self._booted
-            # Target check BEFORE anything is warmed up: if the balance is already at/above TARGET_BALANCE
-            # (e.g. service resumed without raising the target) never trade.
-            if await self._target_gate(first):
+            # Cycle gate BEFORE anything is warmed up: live balance + Deriv's own portfolio decide between recording a new
+            # cycle, resuming the saved one, the profit-target exit, the low-balance exit, or not trading this session.
+            gate = await self._cycle_gate(sess, first)
+            if gate == "stop":
                 return True
+            if gate == "skip":
+                return False
             if first:
                 try:
                     await self.money.start(self.client)     # saved floor/P, live balance, midnight reset
@@ -342,6 +337,11 @@ class BotEngine:
                 if self._target_done.is_set():
                     return True
                 await asyncio.sleep(min(0.5, max(0.01, drain_end - ws.now())))
+            if target_guard.is_reached() and not self._drain_finished.is_set():
+                # a target-hit / low-balance flow is still waiting for Deriv's portfolio to empty: keep the socket until
+                # that drain is over (it is bounded by CYCLE_DRAIN_TIMEOUT_SECONDS and always ends)
+                logger.warning("SESSION %s: holding the socket until the cycle's drain finishes", sess.name)
+                await self._drain_finished.wait()
             try:
                 await asyncio.wait_for(self._before_disconnect(sess), timeout=30)
             except asyncio.CancelledError:
@@ -393,24 +393,312 @@ class BotEngine:
             await asyncio.gather(ws_task, return_exceptions=True)
         return None
 
-    async def _target_gate(self, first: bool) -> bool:
-        """True when the balance target is already reached (shutdown done): the session must not trade."""
-        if target_guard.target() is None:
-            if first:
-                logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
-            return False
+    # ── the cycle: start gate, profit-target exit, low-balance exit (target_guard decides, profit_cycle persists) ──
+    def _min_stake(self) -> float:
+        """The minimum stake the engine can buy with: the money rules' flat stake (PREDICTOR_STAKE) - the SAME value
+        next_stake() hands to every buy and reserve() checks the balance against. Not Deriv's per-contract minimum: the
+        engine never reads one, so PREDICTOR_STAKE must be at least what Deriv accepts for the contracts traded."""
+        stake = self._next_stake()
+        return float(stake if stake is not None else self.stake)
+
+    def _cycle_fields(self) -> dict:
+        return profit_cycle.dashboard_fields(self.client.balance, self._min_stake())
+
+    async def _portfolio_flat(self) -> Optional[bool]:
+        """Deriv's OWN portfolio decides: True = no open contract (and no buy in flight), False = something is open,
+        None = could not ask (never treated as flat). Local state is not trusted: Deriv deducts the stake at purchase."""
         try:
-            self.balance = await self.client.fetch_balance_live()
+            contracts = await self.client.get_portfolio(strict=True, timeout=15.0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Initial live balance fetch failed (%s) - using subscribed value", exc)
-        logger.info("TARGET GUARD: target=%.2f  live balance=%.2f", target_guard.target(), self.balance)
-        if target_guard.should_stop(self.balance):
-            if target_guard.mark_reached(self.balance):
-                await self._shutdown_for_target(self.balance)
+            logger.warning("CYCLE: portfolio check failed (%s) - not treated as flat", exc)
+            return None
+        self._deriv_open = len(contracts or [])
+        if self._deriv_open == 0 and self._open:
+            logger.info("CYCLE: Deriv's portfolio is empty but %d contract(s) are still tracked locally "
+                        "(result messages pending) - Deriv's state wins", len(self._open))
+        return self._deriv_open == 0 and not self._busy
+
+    async def _confirmed_live_balance(self) -> Optional[float]:
+        """A balance read from Deriv RIGHT NOW (never the cached value). None when it cannot be read or is unusable. An
+        exact 0.00 is accepted only after three consecutive live reads agree: a default/uninitialised 0.0 must never
+        trigger a terminal action."""
+        zeros = 0
+        for attempt in range(1, 6):
+            try:
+                bal = float(await self.client.fetch_balance_live())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("CYCLE: live balance read %d failed: %s", attempt, exc)
+                await asyncio.sleep(1.0)
+                continue
+            if not target_guard.valid_balance(bal, zero_confirmed=True):
+                logger.warning("CYCLE: unusable balance %r from Deriv - ignored", bal)
+                return None
+            if bal > 0:
+                return bal
+            zeros += 1
+            if zeros >= 3:
+                return 0.0
+            await asyncio.sleep(1.0)
+        return None
+
+    def _log_cycle_boot(self, min_stake: float, start: float, bal: float):
+        tp = target_guard.target_profit()
+        if target_guard.deprecated_target_balance_set():
+            logger.warning("TARGET_BALANCE is DEPRECATED and IGNORED - use TARGET_PROFIT (profit per cycle)")
+        logger.info("CYCLE: TARGET_PROFIT=%s | starting balance=%s | target balance=%s | live balance=%.2f | min stake %.2f",
+                    f"{tp:.2f}" if tp is not None else "OFF (unset/0/invalid: records a start and trades, never redeploys on profit)",
+                    f"{start:.2f}" if start > 0 else "none (new cycle)",
+                    f"{target_guard.target_balance_for(start, tp):.2f}" if (start > 0 and tp is not None) else "-",
+                    bal, min_stake)
+
+    def _start_terminal(self, coro) -> None:
+        """Run the target-hit / low-balance flow as ONE task that run() waits for (see _await_terminal)."""
+        self._drain_finished.clear()
+        self._terminal_task = asyncio.get_running_loop().create_task(coro)
+
+    async def _cycle_gate(self, sess: "ws.Session", first: bool) -> str:
+        """Right after every connect: 'go' = trade this session, 'stop' = a terminal flow (profit target / low balance)
+        took over, 'skip' = do not trade this session (nothing could be verified; the next session retries). Everything
+        is judged on a live balance and Deriv's own portfolio (see boot_decision)."""
+        min_stake = self._min_stake()
+        wait_end = time.monotonic() + min(target_guard.drain_timeout_seconds(), max(5.0, sess.close_ts - ws.now()))
+        warned = 0.0
+        while True:
+            bal = await self._confirmed_live_balance()
+            flat = await self._portfolio_flat() if bal is not None else None
+            if bal is not None and flat is not None:
+                start = profit_cycle.starting_balance()
+                decision = target_guard.boot_decision(start, bal, target_guard.target_profit(), min_stake, flat,
+                                                      zero_confirmed=(bal == 0.0))
+                if decision != target_guard.WAIT_FLAT:
+                    break
+            if time.monotonic() >= wait_end:
+                logger.critical("CYCLE: SESSION %s NOT TRADED - no usable live balance / flat portfolio before the "
+                                "session ended (retrying next session)", sess.name)
+                profit_cycle.set_phase(profit_cycle.RECORDING, "waiting for a verified flat portfolio / live balance")
+                return "skip"
+            if time.monotonic() - warned >= 10:
+                warned = time.monotonic()
+                logger.warning("CYCLE START: waiting for a flat portfolio (%d open on Deriv) before recording the "
+                               "starting balance", self._deriv_open)
+                profit_cycle.set_phase(profit_cycle.RECORDING, "waiting for open contracts to settle")
+            await asyncio.sleep(2.0)
+
+        self.balance = bal
+        if first or decision in (target_guard.TARGET_HIT, target_guard.LOW_BALANCE):
+            self._log_cycle_boot(min_stake, start, bal)
+        if decision == target_guard.LOW_BALANCE:
+            if target_guard.mark_low_balance(bal):
+                self._start_terminal(self._run_low_balance_exit(bal))
+            await self._drain_finished.wait()
+            return "stop"
+        if decision == target_guard.TARGET_HIT:
+            if target_guard.mark_reached(bal):
+                self._start_terminal(self._run_target_hit(bal))
+            await self._drain_finished.wait()
+            return "stop"
+        if not profit_cycle.persistence_configured():       # no way to save / clear the cycle or to redeploy: do not trade
+            profit_cycle.warn_persistence_not_configured()
+            profit_cycle.set_phase(profit_cycle.RECORDING, "RENDER_API_KEY / RENDER_SERVICE_ID missing - not trading")
+            return "skip"
+        if decision == target_guard.RECORD:
+            profit_cycle.set_phase(profit_cycle.RECORDING, "recording the starting balance")
+            if not await asyncio.to_thread(profit_cycle.record_start, bal):
+                logger.critical("CYCLE: the starting balance could NOT be saved - session %s not traded", sess.name)
+                return "skip"
+        else:
+            profit_cycle.set_phase(profit_cycle.TRADING)
+        profit_cycle.publish(bal, min_stake)
+        return "go"
+
+    async def _drain_open_contracts(self) -> bool:
+        """Wait (polling Deriv's portfolio, progress logged) until every open contract has settled. CYCLE_DRAIN_TIMEOUT_
+        SECONDS (default 900) bounds it: on timeout log CRITICAL, raise the dashboard flag and carry on - the next
+        cycle's start still waits for a flat portfolio, so leaked contracts cannot corrupt its baseline."""
+        timeout = target_guard.drain_timeout_seconds()
+        t0 = time.monotonic()
+        last_log = -1e9
+        try:
+            while True:
+                flat = await self._portfolio_flat()
+                if flat is True:
+                    logger.warning("CYCLE DRAIN: portfolio is flat after %.0fs", time.monotonic() - t0)
+                    return True
+                waited = time.monotonic() - t0
+                if waited >= timeout:
+                    logger.critical("CYCLE DRAIN TIMED OUT after %.0fs (%s) - continuing; the next cycle's start waits "
+                                    "for a flat portfolio", waited,
+                                    f"{self._deriv_open} contract(s) still open on Deriv" if flat is False else "portfolio unreadable")
+                    profit_cycle.set_alert("drain_timeout", True)
+                    return False
+                if waited - last_log >= 10:
+                    last_log = waited
+                    logger.warning("CYCLE DRAIN: %s - waited %.0fs of max %.0fs",
+                                   f"{self._deriv_open} contract(s) open on Deriv" if flat is False else "portfolio unreadable",
+                                   waited, timeout)
+                await asyncio.sleep(2.0)
+        finally:
+            self._drain_finished.set()
+
+    async def _stop_deriv(self, reason: str):
+        """Drop the Deriv socket for good (no reconnect), flush stats."""
+        try:
+            self.client.set_reconnect_enabled(False)
+        except Exception:
+            pass
+        try:
+            await self.client.shutdown(reason)
+        except Exception as exc:
+            logger.warning("CYCLE: client shutdown error: %s", exc)
+        try:
+            await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
+        except Exception as exc:
+            logger.warning("CYCLE: stats flush skipped: %s", exc)
+
+    async def _clear_until_verified(self):
+        """Clear the saved starting balance and VERIFY it; retried with backoff (CRITICAL + dashboard alert) until it is.
+        Nothing irreversible (redeploy / suspend) happens before this returns."""
+        attempt = 0
+        while True:
+            profit_cycle.set_phase(profit_cycle.CLEARING, "clearing the saved starting balance")
+            if await asyncio.to_thread(profit_cycle.clear_start):
+                return
+            attempt += 1
+            wait = profit_cycle.backoff_seconds(attempt)
+            profit_cycle.set_phase(profit_cycle.CLEARING, f"clear NOT verified - retrying in {wait:.0f}s (no redeploy/suspend yet)")
+            logger.critical("CYCLE: starting-balance clear not verified (attempt %d) - retrying in %.0fs", attempt, wait)
+            await asyncio.sleep(wait)
+
+    async def _redeploy_until_accepted(self):
+        """Trigger the redeploy (retry with backoff on failure); a deploy that FAILS afterwards is retried too."""
+        attempt = 0
+        while True:
+            ok, info = await asyncio.to_thread(profit_cycle.trigger_redeploy)
+            if ok:
+                profit_cycle.set_alert("redeploy_retrying", False)
+                profit_cycle.set_phase(profit_cycle.REDEPLOYING, f"deploy {info or '?'} requested - the new process starts the next cycle")
+                if await self._watch_deploy(info):
+                    return
+            attempt += 1
+            wait = profit_cycle.backoff_seconds(attempt)
+            profit_cycle.set_alert("redeploy_retrying", True)
+            profit_cycle.set_phase(profit_cycle.REDEPLOYING, f"redeploy not done ({info}) - retrying in {wait:.0f}s")
+            logger.error("CYCLE: redeploy not accepted/failed (%s) - retry %d in %.0fs", info, attempt, wait)
+            await asyncio.sleep(wait)
+
+    async def _watch_deploy(self, deploy_id: str) -> bool:
+        """True = the deploy is live (or cannot be watched: hook without an id); False = it failed (caller retries)."""
+        if not deploy_id or not profit_cycle.persistence_configured():
             return True
-        return False
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 1800:
+            await asyncio.sleep(20.0)
+            status = await asyncio.to_thread(profit_cycle.deploy_status, deploy_id)
+            if status in ("live", "deactivated"):
+                return True
+            if status in ("build_failed", "update_failed", "pre_deploy_failed", "canceled"):
+                logger.error("CYCLE: deploy %s is %s", deploy_id, status)
+                return False
+        logger.critical("CYCLE: deploy %s still not live after 30 min - check Render", deploy_id)
+        return True
+
+    async def _run_target_hit(self, bal: float):
+        """Profit target reached (the once-only claim is already made, so nothing new can be proposed or bought):
+        drain -> record the cycle -> verified clear -> optional cooldown -> redeploy (retried)."""
+        try:
+            start = profit_cycle.starting_balance()
+            logger.warning("CYCLE TARGET HIT: live balance %.2f, starting balance %.2f, net profit %+.2f >= TARGET_PROFIT %s",
+                           bal, start, (target_guard.net_profit(bal, start) or 0.0), target_guard.target_profit())
+            profit_cycle.set_phase(profit_cycle.DRAINING, "profit target reached - waiting for open contracts to settle")
+            self._publish(session="CYCLE TARGET REACHED - draining", open_contracts_count=len(self._open))
+            await self._drain_open_contracts()
+            final = await self._confirmed_live_balance()
+            if final is None:
+                final = bal
+                logger.warning("CYCLE: no live balance after the drain - recording the net profit at the trigger value")
+            net = target_guard.net_profit(final, start)
+            await self._stop_deriv("cycle profit target reached")
+            await asyncio.to_thread(profit_cycle.record_completed_cycle, net)
+            await self._clear_until_verified()
+            cooldown = target_guard.cooldown_seconds()
+            if cooldown > 0:
+                profit_cycle.set_phase(profit_cycle.REDEPLOYING, f"cooldown {cooldown:.0f}s before the redeploy")
+                logger.warning("CYCLE: cooldown %.0fs before the redeploy", cooldown)
+                await asyncio.sleep(cooldown)
+            await self._redeploy_until_accepted()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.critical("CYCLE TARGET FLOW crashed: %s", exc, exc_info=True)
+            profit_cycle.set_phase(profit_cycle.IDLE, f"target flow crashed ({exc}) - check the logs")
+        finally:
+            self._drain_finished.set()
+            self._target_done.set()
+
+    async def _run_low_balance_exit(self, bal: float):
+        """Balance below the minimum stake with a flat portfolio (claim already made): re-verify -> stop -> verified clear
+        -> SUSPEND the service (never before the clear). Without a Render API key: stopped + disconnected, idle."""
+        released = False
+        try:
+            logger.warning("CYCLE LOW BALANCE: live balance %.2f < minimum stake %.2f and the portfolio is flat",
+                           bal, self._min_stake())
+            profit_cycle.set_phase(profit_cycle.DRAINING, "low balance - re-verifying that nothing is open")
+            drained = await self._drain_open_contracts()
+            final = await self._confirmed_live_balance()
+            if drained and final is not None and not target_guard.low_balance(
+                    final, self._min_stake(), True, zero_confirmed=(final == 0.0)) and target_guard.release(target_guard.LOW):
+                released = True                                 # a straggler win lifted the balance: keep trading
+                self._drain_finished.clear()
+                profit_cycle.set_phase(profit_cycle.TRADING)
+                return
+            await self._stop_deriv("balance below the minimum stake")
+            if not profit_cycle.persistence_configured():
+                profit_cycle.warn_persistence_not_configured()
+                profit_cycle.set_alert("idle_not_suspended", True)
+                profit_cycle.set_phase(profit_cycle.IDLE, "Balance below the minimum stake: trading stopped and disconnected. "
+                                       "The service is IDLE and NOT suspended (RENDER_API_KEY missing) - top up, then restart it")
+                logger.critical("CYCLE LOW BALANCE: no RENDER_API_KEY - stopped and disconnected, service left RUNNING IDLE")
+                return
+            await self._clear_until_verified()
+            for attempt in range(1, 6):                         # suspend only AFTER the verified clear
+                profit_cycle.set_phase(profit_cycle.SUSPENDED, "balance below the minimum stake - suspending this service")
+                if await asyncio.to_thread(target_guard.suspend_service):
+                    profit_cycle.set_phase(profit_cycle.SUSPENDED, "SUSPENDED: top up the account, then Resume the service in Render "
+                                           "(the starting balance is cleared: a fresh cycle begins)")
+                    return
+                await asyncio.sleep(profit_cycle.backoff_seconds(attempt))
+            profit_cycle.set_alert("idle_not_suspended", True)
+            profit_cycle.set_phase(profit_cycle.IDLE, "Balance below the minimum stake: stopped and disconnected, but Render refused "
+                                   "the suspend - the service is IDLE and NOT suspended")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.critical("CYCLE LOW-BALANCE FLOW crashed: %s", exc, exc_info=True)
+            profit_cycle.set_phase(profit_cycle.IDLE, f"low-balance flow crashed ({exc}) - check the logs")
+        finally:
+            self._drain_finished.set()
+            if not released:
+                self._target_done.set()
+
+    async def _low_balance_check(self):
+        """While trading: below the minimum stake, judged ONLY when Deriv's portfolio is flat (pending payouts make the
+        balance look low), on a live balance, once-only (a profit-target claim that got there first wins)."""
+        if target_guard.is_reached() or self._open or self._busy:
+            return
+        min_stake = self._min_stake()
+        if target_guard.money(self.client.balance) >= target_guard.money(min_stake) - target_guard.EPS:
+            return                                              # cheap pre-filter on the streamed balance
+        if await self._portfolio_flat() is not True:
+            return
+        bal = await self._confirmed_live_balance()
+        if bal is None or not target_guard.low_balance(bal, min_stake, True, zero_confirmed=(bal == 0.0)):
+            return
+        if target_guard.mark_low_balance(bal):
+            self._start_terminal(self._run_low_balance_exit(bal))
 
     async def _warm(self, sess: "ws.Session", first: bool):
         """Everything slow, finished BEFORE open_ts: clock burst, then boot fit (first session after process
@@ -814,53 +1102,44 @@ class BotEngine:
         exc = None if ws_task.cancelled() else ws_task.exception()
         raise RuntimeError("Deriv WebSocket task ended unexpectedly") from exc
 
-    # ── balance target ───────────────────────────────────────────────────────
+    # ── cycle balance watch ──────────────────────────────────────────────────
     def _on_balance(self, bal: float):
         """Runs on EVERY live balance update from Deriv (inside the event loop)."""
-        self.balance = bal
+        prev, self.balance = self.balance, bal
         self.money.on_balance(bal)
-        if target_guard.should_stop(bal) and target_guard.mark_reached(bal):
-            # flag is already set (no new trade can start); do the slow part as a task
-            asyncio.get_running_loop().create_task(self._shutdown_for_target(bal))
+        self._note_balance_jump(prev, bal)
+        start = profit_cycle.starting_balance()
+        if start > 0 and target_guard.target_hit(bal, start) and target_guard.mark_reached(bal):
+            # flag is already set (no new trade can start); do the slow part as ONE task that run() waits for
+            self._start_terminal(self._run_target_hit(bal))
+
+    def _note_balance_jump(self, prev, bal):
+        """Net profit is a balance difference, so a deposit / withdrawal / demo balance reset shifts it. Cheap detector: a
+        single update larger than any one trade can explain is only logged (WARNING) - nothing is corrected."""
+        try:
+            if not prev or prev <= 0:
+                return
+            allowed = max(12.0 * self._min_stake(), 5.0)
+            if abs(bal - prev) > allowed:
+                logger.warning("BALANCE JUMP %.2f -> %.2f (%+.2f): larger than one trade can explain (deposit, withdrawal or "
+                               "demo reset?) - this cycle's net profit (balance difference) is distorted",
+                               prev, bal, bal - prev)
+        except Exception:
+            pass
 
     async def _target_monitor_loop(self):
-        """Safety net next to the balance stream: poll Deriv's live balance directly."""
+        """Safety net next to the balance stream: poll Deriv's live balance (profit target) and watch the low-balance exit."""
         while not target_guard.is_reached():
             await asyncio.sleep(target_guard.check_seconds())
-            if target_guard.target() is None or not self.client.is_connected:
+            if not self.client.is_connected:
                 continue
             try:
-                await self.client.fetch_balance_live()     # fires _on_balance -> target check
+                await self.client.fetch_balance_live()     # fires _on_balance -> profit-target check
+                await self._low_balance_check()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("target monitor: balance poll failed: %s", exc)
-
-    async def _shutdown_for_target(self, bal: float):
-        """Target hit: (flag already set) -> drop the Deriv socket -> flush stats -> suspend Render."""
-        try:
-            logger.warning("TARGET SHUTDOWN: balance %.2f, %d contract(s) still open on Deriv "
-                           "(they settle on Deriv's side; not waiting)", bal, len(self._open))
-            try:
-                import keep_alive
-                keep_alive.update_status(session="TARGET REACHED - STOPPED",
-                                         open_contracts_count=len(self._open))
-            except Exception:
-                pass
-            try:
-                self.client.set_reconnect_enabled(False)
-            except Exception:
-                pass
-            await self.client.shutdown("balance target reached")
-            try:
-                await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
-            except Exception as exc:
-                logger.warning("TARGET SHUTDOWN: stats flush skipped: %s", exc)
-            await asyncio.to_thread(target_guard.suspend_service)
-        except Exception as exc:
-            logger.error("TARGET SHUTDOWN error: %s", exc, exc_info=True)
-        finally:
-            self._target_done.set()
+                logger.debug("cycle monitor: check failed: %s", exc)
 
     async def _watchdog_loop(self):
         """Tick streams can die silently while the socket (and its pings) look fine."""
@@ -1038,7 +1317,7 @@ class BotEngine:
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=sum(len(p.selected) for p in self.predictors.values()),
                     open_contracts_count=len(self._open),
-                    target_balance=target_guard.target(), money=self.money.snapshot())
+                    **self._cycle_fields(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass

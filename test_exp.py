@@ -179,41 +179,6 @@ def test_stopping_rule_and_demo_only():
         config.TEST_MODE, config.DERIV_ACCOUNT_MODE, config.SET_ALLOW_REAL = False, mode, real
 
 
-def test_redeploy_never_clears_cache():
-    import redeploy_guard
-    assert redeploy_guard.NO_CLEAR == {"clearCache": "do_not_clear"}
-    src = open("restart_scheduler.py").read() + open("redeploy_guard.py").read()
-    assert '"clearCache": "clear"' not in src and "clearCache='clear'" not in src      # no request body that clears the cache
-    assert config.AUTO_REDEPLOY_SECONDS == 420 and config.AUTO_REDEPLOY_ENABLED     # 7-minute cycle, always on
-
-
-def test_redeploy_cycle_repeats_forever():
-    """The scheduler must raise 'pending' again after every redeploy, cycle after cycle."""
-    import asyncio, restart_scheduler as rs, redeploy_guard as rg
-    saved = (config.REDEPLOY_INTERVAL_SECONDS, config.REDEPLOY_BUY_BLOCK_SECONDS, rg.preflight)
-    config.REDEPLOY_INTERVAL_SECONDS, config.REDEPLOY_BUY_BLOCK_SECONDS = 0.3, 0.0
-    rg.preflight = lambda: (True, "")
-    fired = []
-    async def go():
-        t = asyncio.ensure_future(rs.run_scheduler())
-        for _ in range(3):                                   # three full cycles
-            for _ in range(200):
-                if rs.is_redeploy_pending():
-                    break
-                await asyncio.sleep(0.05)
-            assert rs.is_redeploy_pending()
-            fired.append(time.time())
-            rs._pending = False                              # what trigger_redeploy() does once the deploy is requested
-            await asyncio.sleep(0.05)
-        t.cancel()
-    try:
-        asyncio.run(go())
-    finally:
-        config.REDEPLOY_INTERVAL_SECONDS, config.REDEPLOY_BUY_BLOCK_SECONDS, rg.preflight = saved
-        rs._pending = False
-    assert len(fired) == 3 and fired[1] - fired[0] >= 0.25
-
-
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

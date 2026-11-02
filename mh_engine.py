@@ -37,7 +37,6 @@ from exp_stats import EXP
 import mh_predictor as mp
 import predictor as pred
 import set_predictor as sp
-import target_guard
 import window_scheduler as ws
 from bot_engine import BotEngine, _cfg
 from set_engine import SetEngine, account_allowed
@@ -2563,7 +2562,7 @@ class MHEngine(SetEngine):
                     balance=round(self.client.balance, 2), session="MH MODE (demo)",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=self._n_tradable(), open_contracts_count=len(self._open),
-                    target_balance=target_guard.target(), money=self.money.snapshot())
+                    **self._cycle_fields(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
                 account_history.note_balance(self.client.balance)
             except Exception:

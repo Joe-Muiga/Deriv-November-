@@ -222,7 +222,7 @@ def test_wilson():
 def test_engine_flow_with_fake_client():
     import asyncio, time
     import config
-    import bot_engine, restart_scheduler, predictor_stats
+    import bot_engine, predictor_stats
 
     digits = planted_digits(23_000, seed=21)
     WARM = 20_000
@@ -289,18 +289,7 @@ def test_engine_flow_with_fake_client():
         print(f"[engine] contracts bought={buys} stats_trades={snap['t'][0]} wins={snap['t'][1]} net={snap['t'][3]:.0f}")
         assert buys > 0 and snap["t"][0] == buys and not eng._open
         assert all(r["amount"] == 1000.0 for r in fake.sent if "proposal" in r), "flat 1000.00 stake"
-        # redeploy drain: pending flag -> no new trades -> trigger fired once, stats flushed
-        calls = []
-        restart_scheduler.trigger_redeploy = lambda: calls.append(1)
-        restart_scheduler._pending = True
-        await asyncio.sleep(3.5)
-        assert calls == [1], calls
-        before = fake.cid
-        fake.tick_cb({"quote": 1234.53, "epoch": 10**7})
-        await asyncio.sleep(0.05)
-        assert fake.cid == before, "no new trades while a redeploy is pending/halted"
         worker.cancel(); settle.cancel()
-        restart_scheduler._pending = False
     asyncio.run(scenario())
 
 
@@ -344,7 +333,7 @@ def test_digit_helpers_match_signal_engine():
 def test_smoke_imports_and_no_legacy_references():
     root = os.path.dirname(os.path.abspath(__file__))
     for m in ("config", "signal_engine", "bot_engine", "keep_alive", "main", "predictor",
-              "predictor_stats", "restart_scheduler"):
+              "predictor_stats", "profit_cycle", "target_guard", "env_persist"):
         __import__(m)
     pat = re.compile(r"donkey|fixed_cycle", re.I)
     hits = []

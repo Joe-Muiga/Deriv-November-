@@ -1210,8 +1210,7 @@ class DerivClient:
         Spec point 10 (Aug 2026): Render's filesystem is ephemeral across
         deploys on this plan, and the bot's own in-memory open-contract
         tracking is wiped on every process restart too. Since the bot
-        force-redeploys itself every REDEPLOY_INTERVAL_HOURS (spec point
-        11), that's a real, frequent blackout window for the dashboard
+        redeploys itself after every profit-target cycle, that's a blackout window for the dashboard
         unless "what's open" is re-derived from Deriv's server on startup
         instead of assumed to have survived locally. Call this once, right
         after connecting, and use the result to rebuild both bot_engine.py's
@@ -1249,7 +1248,7 @@ class DerivClient:
         if self._stopped:
             raise RuntimeError("Client shut down")
         if "buy" in payload or "proposal" in payload:
-            # Balance-target guard: once TARGET_BALANCE is hit nothing new may be priced or bought.
+            # Cycle stop guard: once the profit target / low-balance exit is claimed nothing new may be priced or bought.
             import target_guard
             if target_guard.is_reached():
                 raise RuntimeError("TARGET_REACHED: trading stopped, order not sent")

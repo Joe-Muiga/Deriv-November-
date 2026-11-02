@@ -7,8 +7,8 @@ When the switch is ON ("paused"):
   * contracts that are already open are left alone and settle normally;
   * the bot stays connected and the dashboard keeps updating.
 
-The state survives redeploys (this bot redeploys itself once an hour, before
-Session A): it is mirrored into this service's own KILL_SWITCH env var through
+The state survives redeploys (the profit cycle redeploys the service after each
+completed cycle): it is mirrored into this service's own KILL_SWITCH env var through
 env_persist.put_env_vars_sync (Render API), and read back at boot.
 Without RENDER_API_KEY the switch still works, but only until the next
 redeploy — the dashboard says so. Note: Render may restart the service when

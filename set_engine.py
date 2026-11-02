@@ -29,7 +29,6 @@ from typing import Dict, List, Optional, Tuple
 import config
 import predictor as pred
 import set_predictor as sp
-import target_guard
 from bot_engine import BotEngine, _cfg
 
 logger = logging.getLogger(__name__)
@@ -384,7 +383,7 @@ class SetEngine(BotEngine):
                     balance=round(self.client.balance, 2), session="SET MODE (demo)",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=len(self._signals), open_contracts_count=len(self._open),
-                    target_balance=target_guard.target(), money=self.money.snapshot())
+                    **self._cycle_fields(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass

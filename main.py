@@ -6,13 +6,13 @@ main.py – entry point (Render web service).
                    (Session A / Session B, connect leads, disconnect, drain); this file only builds it and
                    rebuilds it if it ever crashes or returns. There is no cooldown / cycle / restart timer here.
   • keep-alive   : self-ping of /health.
-  • redeploy     : one redeploy before EACH session (two per hour), fired by the redeploy-watcher thread
-                   (redeploy_guard.maybe_fire, polled once a second) while the instance is idle after the previous
-                   session, so the fresh instance is live before the next connect lead. clearCache is "clear".
+  • cycle        : the never-ending profit cycle (profit_cycle.py / bot_engine.py): record the starting balance, trade,
+                   at net profit >= TARGET_PROFIT drain -> clear the starting balance -> redeploy; below the minimum
+                   stake with nothing open -> clear -> suspend. There is NO time-based redeploy.
   • SIGTERM      : disconnects from Deriv, flushes stats / ledger and follower DB buffers, then exits.
 
-Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
-optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
+Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (required for the cycle: saves the starting balance, redeploys,
+suspends), TARGET_PROFIT (manual profit target per cycle; the bot only reads it), optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
 account the token's OTP is minted for), DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
 
 Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see render.yaml.
@@ -67,7 +67,7 @@ def _run_bot():
         from bot_engine import BotEngine as Engine
     while True:
         if target_guard.is_reached():
-            logger.warning("Balance target reached - bot stays stopped (no restart)")
+            logger.warning("Cycle ended (profit target / low balance) - bot stays stopped (no restart)")
             return
         eng = Engine()
         _live["engine"] = eng
@@ -78,21 +78,10 @@ def _run_bot():
         finally:
             _live["engine"], _live["loop"] = None, None
         if target_guard.is_reached():
-            logger.warning("Balance target reached - bot stays stopped (no restart)")
+            logger.warning("Cycle ended (profit target / low balance) - bot stays stopped (no restart)")
             return
         logger.warning("Bot engine returned or crashed; building a new engine in 5 s")
         time.sleep(5)
-
-
-def _redeploy_watcher():
-    """Polls redeploy_guard.maybe_fire() once a second (it is blocking when it talks to Render, hence its own thread)."""
-    import redeploy_guard
-    while True:
-        try:
-            redeploy_guard.maybe_fire()
-        except Exception as exc:                     # maybe_fire never raises; belt and braces
-            logger.error(f"redeploy watcher error: {exc}", exc_info=True)
-        time.sleep(1.0)
 
 
 async def _graceful_engine_stop(eng):
@@ -168,7 +157,7 @@ def _log_startup() -> None:
     if legacy:
         logger.warning("  Legacy redeploy env vars are set on Render and IGNORED: %s - delete them", ", ".join(legacy))
     if not config.SESSION_SCHEDULE_ENABLED:
-        logger.critical("  SESSION SCHEDULE IS OFF (SESSION_SCHEDULE_ENABLED=0): the session clock and the pre-A redeploy are disabled")
+        logger.critical("  SESSION SCHEDULE IS OFF (SESSION_SCHEDULE_ENABLED=0): the session clock is disabled")
     else:
         close_x = config.SESSION_CLOSE_EXTRA_SECONDS
         logger.info("  Sessions     : A %s-%s | B %s-%s (mm:ss.mmm past each hour, UTC, drain/close incl. +%.0fs); "
@@ -176,24 +165,23 @@ def _log_startup() -> None:
                     _mmss(config.SESSION_A_OPEN_SECOND), _mmss(config.SESSION_A_END_SECOND + close_x),
                     _mmss(config.SESSION_B_OPEN_SECOND), _mmss(config.SESSION_B_END_SECOND + close_x),
                     close_x, config.WINDOW_PRECONNECT_SECONDS)
-    if config.PRE_A_REDEPLOY_ENABLED and config.SESSION_SCHEDULE_ENABLED:
-        import render_api
-        has_api = render_api.api_configured()
-        has_hook = bool((os.environ.get("RENDER_DEPLOY_HOOK_URL") or getattr(config, "RENDER_DEPLOY_HOOK_URL", "") or "").strip())
-        clear = bool(getattr(config, "PRE_SESSION_REDEPLOY_CLEAR_CACHE", True))
-        logger.info("  Redeploy     : ON - before EACH session (A and B), idle gap after the previous one, finishing %.0fs before the "
-                    "connect lead (expected duration = P95 of Render deploys, default %.0fs), clearCache=%s",
-                    config.PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS, config.PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS,
-                    "clear" if clear else "do_not_clear")
-        if clear and not has_api:
-            logger.critical("  Redeploy     : ENABLED with cache clearing but RENDER_API_KEY / RENDER_SERVICE_ID is not set - NO redeploy will happen "
-                            "(a deploy hook cannot clear the build cache)")
-        elif not (has_api or has_hook):
-            logger.critical("  Redeploy     : ENABLED but neither RENDER_API_KEY(+RENDER_SERVICE_ID) nor RENDER_DEPLOY_HOOK_URL is set - NO redeploy will happen")
-    else:
-        logger.info("  Redeploy     : OFF (PRE_A_REDEPLOY_ENABLED=0 or schedule off)")
+    import profit_cycle
+    import render_api
     import target_guard as _tg
-    logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
+    logger.info("  Redeploy     : only after a profit-target cycle (no time-based redeploy)")
+    tp = _tg.target_profit()
+    start = profit_cycle.starting_balance()
+    logger.info("  Cycle        : TARGET_PROFIT=%s | starting balance=%s | target balance=%s | cycles done %d | lifetime profit %+.2f",
+                f"{tp:.2f}" if tp is not None else "OFF (unset/0/invalid: a start is recorded and the bot trades, but it never redeploys on profit)",
+                f"{start:.2f}" if start > 0 else "none (a new cycle starts at the first connect)",
+                f"{_tg.target_balance_for(start, tp):.2f}" if (start > 0 and tp is not None) else "-",
+                profit_cycle.cycle_count(), profit_cycle.lifetime_profit())
+    if _tg.deprecated_target_balance_set():
+        logger.warning("  TARGET_BALANCE is DEPRECATED and IGNORED - set TARGET_PROFIT (profit per cycle) instead")
+    if not render_api.api_configured():
+        profit_cycle.warn_persistence_not_configured()
+    else:
+        profit_cycle.set_phase(profit_cycle.RECORDING if start <= 0 else profit_cycle.TRADING)
     logger.info(f"  Port         : {config.PORT}")
 
 
@@ -203,7 +191,6 @@ if __name__ == "__main__":
     _log_startup()
     start_keep_alive()
     signal.signal(signal.SIGTERM, _on_sigterm)       # always: disconnect from Deriv + flush, even without followers
-    threading.Thread(target=_redeploy_watcher, name="redeploy-watcher", daemon=True).start()
 
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
     # any failure here is logged and the main account below starts regardless.

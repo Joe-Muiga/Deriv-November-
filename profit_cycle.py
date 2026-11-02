@@ -1,444 +1,315 @@
 """
-profit_cycle.py – persistent profit-target trading cycle.
+profit_cycle.py – the persistent, never-ending profit cycle: state, persistence, redeploy and dashboard fields.
+(The decisions are pure functions in target_guard.py; the orchestration - connect, drain, stop - is in bot_engine.py.)
 
-Spec (Sep 2026): the bot captures a "cycle starting balance" the first
-time it connects, then trades until the live balance has grown
-config.PROFIT_CYCLE_TARGET_PCT (default 50%) above that value. Once the
-target is hit it drains any open contracts, then goes into a cooldown of
-config.PROFIT_CYCLE_COOLDOWN_MINUTES (default 17) during which it is NOT
-connected to Deriv at all — only the Flask health endpoint and the
-self-ping keep-alive thread keep running, so Render's health checks (and
-the bot's own 24/7-uptime self-ping) keep passing. When the cooldown
-elapses this module fires the Render deploy hook, which brings up a
-fresh deploy that starts a brand-new cycle from whatever the balance is
-at that point — forever.
+One cycle:   record the live balance as the STARTING BALANCE (flat portfolio) -> trade -> net profit
+(= live balance - starting balance) reaches TARGET_PROFIT -> drain -> record the cycle -> CLEAR the starting balance
+(verified) -> redeploy -> the fresh process boots, sees an empty starting balance and starts the next cycle.
+A cycle that runs the balance below the minimum stake ends differently: clear (verified) -> suspend (no redeploy).
 
-Starting-balance drawdown override (Sep 2026): independent of the
-target-hit path above, checked only at the moment bot_engine sees the
-ordinary rolling REDEPLOY_INTERVAL_HOURS redeploy come due
-(restart_scheduler.is_redeploy_pending()). If the live balance is
-config.PROFIT_CYCLE_STARTING_DRAWDOWN_PCT (default 25%) or more BELOW
-this cycle's own starting balance at that moment, the ordinary redeploy
-is skipped and the bot goes straight into the same cooldown+redeploy
-path a target-hit takes instead — it does NOT redeploy plainly and keep
-trading the same losing cycle. Reaching the profit target, at any other
-time the bot is live, still immediately blocks any further new trade
-from firing (see request_cooldown()) while open contracts drain, exactly
-as before — this override doesn't change that.
+PERSISTENCE - Render's disk is ephemeral, so the durable state lives in THIS service's own Render env vars, written
+through the Render API (RENDER_API_KEY, RENDER_SERVICE_ID) and mirrored into os.environ at once:
 
-PERSISTENCE — why this can't just be a local file or an in-memory dict:
-Render's disk on this plan is ephemeral (see bot_engine.py's
-_recover_open_contracts_from_portfolio docstring for the exact same
-point made about open contracts) — every redeploy is a brand-new
-container, so anything written to local disk or kept only in this
-process's memory is gone the instant the rolling REDEPLOY_INTERVAL_HOURS
-redeploy (every 5 min while trading, by default) or the post-cooldown
-redeploy happens. To survive that, the cycle's state is written back
-into THIS SERVICE'S OWN Render environment variables via Render's public
-API (PUT /v1/services/{serviceId}/env-vars/{envVarKey}) every time it
-changes, and read back out of os.environ at boot on the next deploy —
-env vars are the one piece of a Render web service's configuration that
-a fresh deploy of the same service always starts from. This needs two
-extra env vars that don't exist yet elsewhere in this project:
+  CYCLE_STARTING_BALANCE    the cycle's starting balance; "" / "0" = "start a new cycle". Managed by the bot - the only
+                            value you may set by hand is "0" (force a new cycle).
+  CYCLE_COUNT               completed cycles (profit target reached)
+  CYCLE_LIFETIME_PROFIT     sum of the completed cycles' net profit
 
-  RENDER_API_KEY     – Render Dashboard → Account Settings → API Keys
-  RENDER_SERVICE_ID  – the "srv-xxxxxxxxxxxxxxxxxxxx" id in this
-                        service's Settings-page URL
+Everything else - TARGET_PROFIT above all - belongs to the user and is READ-ONLY to the bot: _write() accepts only the
+three keys above and env_persist refuses the protected ones even if some other module asks.
 
-Without both set, persistence is impossible on Render's architecture no
-matter what this module does — see _warn_persistence_not_configured().
+The critical transitions (record the start, clear the start) use env_persist.put_env_var_verified_sync: HTTP 200/201 AND
+a read-back that equals the value. A redeploy is structurally impossible until the clear of THIS process was verified
+(trigger_redeploy() checks) - a redeploy with a stale starting balance would make the next boot resume the finished cycle,
+find the target already met and loop. Without RENDER_API_KEY / RENDER_SERVICE_ID nothing can be persisted or redeployed:
+the engine then does not start a cycle, logs CRITICAL and shows it on the dashboard.
 
-Persisted keys (plain env vars on the service, not a linked env group):
-  CYCLE_PHASE              "trading" | "cooldown"
-  CYCLE_STARTING_BALANCE   the balance this cycle started from
-  CYCLE_COOLDOWN_UNTIL     epoch seconds the current cooldown ends at
-
-Public interface:
-  load_state()                          -> {"phase", "starting_balance",
-                                              "cooldown_until"}
-  in_cooldown_at_boot()                 -> cooldown_until epoch, or None
-  clear_cooldown_and_start_new_cycle()  -> reset persisted state so the
-                                            next connect captures a fresh
-                                            starting balance
-  get_or_init_starting_balance(balance) -> this cycle's starting balance,
-                                            capturing+persisting a new one
-                                            if none survived a redeploy
-  check_target(balance, starting)       -> True once balance is
-                                            PROFIT_CYCLE_TARGET_PCT above
-                                            starting
-  request_cooldown() / is_cooldown_requested()
-                                         -> target-hit pending flag,
-                                            mirrors restart_scheduler.py's
-                                            is_redeploy_pending() pattern
-  is_starting_drawdown_breached(balance, starting)
-                                         -> True once balance has fallen
-                                            PROFIT_CYCLE_STARTING_
-                                            DRAWDOWN_PCT below this
-                                            cycle's own starting balance.
-                                            Checked only when an ordinary
-                                            rolling redeploy is due; when
-                                            True the caller requests a
-                                            cooldown instead of letting
-                                            that redeploy go through
-  enter_cooldown_now()                  -> persists the cooldown window,
-                                            starts the supervisor thread,
-                                            returns cooldown_until
-  start_cooldown_supervisor(until)      -> the thread that waits out the
-                                            cooldown then fires the
-                                            Render deploy hook
+Render's env-var write API is documented not to deploy automatically ("Changes will not be deployed automatically" on the
+bulk endpoint; the single-key endpoint is silent). If a write DID trigger a deploy, trigger_redeploy() notices a deploy that
+is already in flight since the clear and does not start a second one, and a loop brake refuses a new deploy while the
+latest one is younger than MIN_REDEPLOY_GAP_SECONDS.
 """
 
-import asyncio
 import logging
 import os
 import threading
 import time
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
-import aiohttp
 import requests
 
-import config
+import env_persist
+import render_api
+import target_guard as tg
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level state ──────────────────────────────────────────────────────
-_cooldown_requested:   bool  = False
-_persistence_warned_at: float = 0.0
+KEY_START = "CYCLE_STARTING_BALANCE"
+KEY_COUNT = "CYCLE_COUNT"
+KEY_LIFETIME = "CYCLE_LIFETIME_PROFIT"
+BOT_KEYS = frozenset({KEY_START, KEY_COUNT, KEY_LIFETIME})      # the ONLY variables the bot ever writes
+
+# dashboard phases
+RECORDING, TRADING, DRAINING, CLEARING, REDEPLOYING, SUSPENDED, IDLE = (
+    "recording", "trading", "draining", "clearing", "redeploying", "suspended", "idle")
+
+MIN_REDEPLOY_GAP_SECONDS = 300.0         # loop brake: never start a deploy while the latest one is younger than this
+BACKOFF_BASE_SECONDS = 15.0
+BACKOFF_MAX_SECONDS = 600.0
+_FAILED = {"build_failed", "update_failed", "pre_deploy_failed", "canceled"}
+_IN_PROGRESS = {"created", "queued", "build_in_progress", "update_in_progress", "pre_deploy_in_progress"}
+
+_lock = threading.Lock()
+_state = {"phase": RECORDING, "message": "", "persistence_missing": False, "clear_unverified": False,
+          "redeploy_retrying": False, "drain_timeout": False, "idle_not_suspended": False}
+_clear_verified: bool = False            # this process cleared CYCLE_STARTING_BALANCE and read it back
+_clear_verified_at: float = 0.0
+_last_critical = {"persistence": 0.0}
 
 
-def _push_dashboard_flag(**kwargs) -> None:
-    """Soft/optional dashboard visibility, same guarded-lazy-import pattern
-    as restart_scheduler.py's helper of the same name — never let a
-    missing/broken keep_alive break the cycle logic itself."""
+# ── saved state (os.environ is the in-process source of truth, mirrored to Render on every write) ──
+def _float_env(key: str, default: float = 0.0) -> float:
+    try:
+        v = float((os.environ.get(key) or "").strip().replace(",", "").lstrip("$"))
+        return v if v == v and abs(v) != float("inf") else default
+    except ValueError:
+        return default
+
+
+def starting_balance() -> float:
+    """The saved cycle starting balance, 0.0 when none (empty / "0" / invalid = start a new cycle)."""
+    v = _float_env(KEY_START)
+    return v if v > 0 else 0.0
+
+
+def cycle_count() -> int:
+    return max(0, int(_float_env(KEY_COUNT)))
+
+
+def lifetime_profit() -> float:
+    return tg.money(_float_env(KEY_LIFETIME))
+
+
+def persistence_configured() -> bool:
+    return render_api.api_configured()
+
+
+def _write(key: str, value, env_first: bool = False) -> bool:
+    """Verified write of a BOT-managed key. Anything else (TARGET_PROFIT, credentials, ...) is refused."""
+    if key not in BOT_KEYS:
+        raise ValueError(f"profit_cycle may only write {sorted(BOT_KEYS)}, not {key!r}")
+    return env_persist.put_env_var_verified_sync(key, value, env_first=env_first)
+
+
+def warn_persistence_not_configured() -> None:
+    now = time.time()
+    set_alert("persistence_missing", True)
+    if now - _last_critical["persistence"] < 900:        # at most once every 15 minutes
+        return
+    _last_critical["persistence"] = now
+    logger.critical(
+        "\n" + "=" * 78 + "\n"
+        "CYCLE PERSISTENCE NOT CONFIGURED\n"
+        "RENDER_API_KEY and/or RENDER_SERVICE_ID is not set, so the cycle's starting balance cannot be saved, cleared or "
+        "redeployed (Render's disk is ephemeral). No cycle is started and the bot does not trade. Set RENDER_API_KEY "
+        "(Render -> Account Settings -> API Keys); RENDER_SERVICE_ID is injected by Render itself.\n" + "=" * 78)
+
+
+# ── transitions ──────────────────────────────────────────────────────────────
+def record_start(balance: float) -> bool:
+    """Persist `balance` as the new cycle's starting balance (verified). Blocking - run in a thread. Only the caller that
+    verified a flat portfolio and a live balance may call this."""
+    global _clear_verified
+    if not persistence_configured():
+        warn_persistence_not_configured()
+        return False
+    if not tg.valid_balance(balance) or tg.money(balance) <= 0:
+        logger.error("CYCLE: refusing to record an unusable starting balance %r", balance)
+        return False
+    value = f"{tg.money(balance):.2f}"
+    if not _write(KEY_START, value):
+        set_alert("persistence_missing", True)
+        set_phase(RECORDING, "could not save the starting balance on Render - retrying next session")
+        return False
+    with _lock:
+        _clear_verified = False
+        _state.update(persistence_missing=False, clear_unverified=False, redeploy_retrying=False, drain_timeout=False,
+                      idle_not_suspended=False)
+    logger.warning("CYCLE START recorded: starting balance %s (TARGET_PROFIT %s)", value, tg.target_profit() or "OFF")
+    set_phase(TRADING)
+    return True
+
+
+def record_completed_cycle(net: Optional[float]) -> bool:
+    """Once per completed (profit target reached) cycle, BEFORE the clear: CYCLE_COUNT + 1 and CYCLE_LIFETIME_PROFIT += net.
+    Blocking. A failure is logged but never blocks the clear/redeploy (the statistics are not critical)."""
+    net = 0.0 if net is None else float(net)
+    count, life = cycle_count() + 1, tg.money(lifetime_profit() + net)
+    ok = _write(KEY_COUNT, str(count))
+    ok = _write(KEY_LIFETIME, f"{life:.2f}") and ok
+    if ok:
+        logger.warning("CYCLE COMPLETE: net profit %+.2f | cycles %d | lifetime profit %+.2f", net, count, life)
+    else:
+        logger.error("CYCLE COMPLETE: net profit %+.2f - the lifetime statistics could NOT be persisted", net)
+    return ok
+
+
+def clear_start() -> bool:
+    """Clear CYCLE_STARTING_BALANCE ("0") and VERIFY it (HTTP 200/201 + read-back). Blocking. os.environ is cleared at
+    once, so this process never resumes the finished cycle even while the write is retried. Sets the flag that unlocks
+    trigger_redeploy() / the suspend only on verified success."""
+    global _clear_verified, _clear_verified_at
+    os.environ[KEY_START] = "0"          # in-process first, whatever Render says: this process never resumes the cycle
+    ok = persistence_configured() and _write(KEY_START, "0", env_first=True)
+    with _lock:
+        _clear_verified = bool(ok)
+        _clear_verified_at = time.time() if ok else 0.0
+        _state["clear_unverified"] = not ok
+    if not persistence_configured():
+        warn_persistence_not_configured()
+    if ok:
+        logger.warning("CYCLE: starting balance CLEARED and verified on Render")
+    else:
+        logger.critical("CYCLE: starting balance clear NOT VERIFIED - no redeploy / suspend until it is (retrying)")
+    return bool(ok)
+
+
+def clear_verified() -> bool:
+    return _clear_verified
+
+
+def backoff_seconds(attempt: int) -> float:
+    return min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** max(0, attempt - 1)))
+
+
+# ── redeploy ─────────────────────────────────────────────────────────────────
+def _parse_iso(s) -> Optional[float]:
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def recent_deploys(limit: int = 5) -> Optional[list]:
+    """Newest-first [{id, status, createdAt}] from GET /v1/services/{id}/deploys; None without the API."""
+    if not render_api.api_configured():
+        return None
+    r = requests.get(f"{render_api.API_BASE}/services/{render_api.service_id()}/deploys",
+                     headers={"Authorization": f"Bearer {render_api.api_key()}", "Accept": "application/json"},
+                     params={"limit": limit}, timeout=15)
+    r.raise_for_status()
+    out = []
+    for it in r.json():
+        d = it.get("deploy", it)
+        out.append({"id": d.get("id"), "status": d.get("status"), "createdAt": d.get("createdAt")})
+    return out
+
+
+def deploy_status(deploy_id: str) -> Optional[str]:
+    """Render's status of one deploy (None when unknown / not readable)."""
+    try:
+        for d in recent_deploys(10) or []:
+            if d.get("id") == deploy_id:
+                return d.get("status")
+    except Exception as exc:
+        logger.debug("CYCLE: deploy status read failed: %s", exc)
+    return None
+
+
+def trigger_redeploy() -> Tuple[bool, str]:
+    """Redeploy THIS service (render_api.deploy_target(): the deploy hook if one is set, else POST /deploys).
+    Blocking - run in a thread; the caller retries with backoff on (False, reason). Returns (True, deploy_id).
+    Refused unless this process verified the clear of CYCLE_STARTING_BALANCE."""
+    if not _clear_verified:
+        logger.critical("CYCLE: redeploy REFUSED - the starting balance clear is not verified (a redeploy now would "
+                        "resume the finished cycle and loop)")
+        return False, "starting balance clear not verified"
+    target = render_api.deploy_target()
+    if target is None:
+        return False, "no RENDER_API_KEY / RENDER_SERVICE_ID / deploy hook"
+    try:
+        deps = recent_deploys(5)
+    except Exception as exc:                                  # the loop brake fails open: the clear IS verified
+        logger.warning("CYCLE: could not read Render's deploy list (%s) - continuing", exc)
+        deps = None
+    if deps:
+        newest = deps[0]
+        created = _parse_iso(newest.get("createdAt"))
+        if created is not None:
+            if created >= _clear_verified_at - 5 and newest.get("status") in _IN_PROGRESS | {"live"}:
+                logger.warning("CYCLE: deploy %s (%s) already started since the clear - not deploying twice",
+                               newest.get("id"), newest.get("status"))
+                return True, str(newest.get("id") or "")
+            age = time.time() - created
+            if age < MIN_REDEPLOY_GAP_SECONDS:
+                return False, f"latest deploy is only {age:.0f}s old (loop brake {MIN_REDEPLOY_GAP_SECONDS:.0f}s)"
+    url, headers = target
+    try:
+        if headers:       # Render API: keep the build cache, new process only
+            r = requests.post(url, headers=headers, json={"clearCache": "do_not_clear"}, timeout=20)
+        else:             # deploy hook
+            r = requests.post(url, timeout=20)
+    except Exception as exc:
+        return False, f"deploy request failed: {exc}"
+    if r.status_code not in (200, 201, 202):
+        return False, f"HTTP {r.status_code} {r.text[:150]}"
+    try:
+        did = str((r.json() or {}).get("id", "") or "")
+    except Exception:
+        did = ""
+    logger.warning("CYCLE: REDEPLOY triggered (deploy %s) - the new process starts the next cycle", did or "?")
+    return True, did
+
+
+# ── dashboard ────────────────────────────────────────────────────────────────
+def set_phase(phase: str, message: str = "") -> None:
+    with _lock:
+        _state["phase"], _state["message"] = phase, message
+    _push(cycle_phase=phase, cycle_message=message)
+
+
+def set_alert(name: str, on: bool = True) -> None:
+    with _lock:
+        if name not in _state or name in ("phase", "message"):
+            return
+        _state[name] = bool(on)
+    _push(**{f"cycle_alert_{name}": bool(on)})
+
+
+def _push(**kw) -> None:
     try:
         import keep_alive
-        keep_alive.update_status(**kwargs)
+        keep_alive.update_status(**kw)
     except Exception:
         pass
 
 
-def _read_float_env(key: str, default: float) -> float:
-    try:
-        return float(os.environ.get(key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _warn_persistence_not_configured() -> None:
-    global _persistence_warned_at
-    now = time.time()
-    if now - _persistence_warned_at < 900:   # at most once every 15 min
-        return
-    _persistence_warned_at = now
-    logger.critical(
-        "\n" + "=" * 78 + "\n"
-        "PROFIT-CYCLE PERSISTENCE NOT CONFIGURED\n"
-        "RENDER_API_KEY and/or RENDER_SERVICE_ID are not set. The cycle's "
-        "starting balance / phase / cooldown deadline will only live in "
-        "this process's own environment — they WILL be lost on the next "
-        "redeploy (Render's disk here is ephemeral), so the 50%-target "
-        "cycle will silently restart from scratch every redeploy instead "
-        "of tracking growth across the whole cycle. Set both in the "
-        "Render dashboard to fix this:\n"
-        "  RENDER_API_KEY    -> Account Settings -> API Keys\n"
-        "  RENDER_SERVICE_ID -> the srv-xxxxxxxx id in this service's own "
-        "Settings-page URL\n" + "=" * 78
-    )
-    _push_dashboard_flag(cycle_persistence_missing=True)
-
-
-def _persist_env_vars(mapping: dict) -> None:
-    """
-    Reflects `mapping` in this process's own os.environ immediately (so
-    anything reading it later in the same process — e.g.
-    get_or_init_starting_balance() right after
-    clear_cooldown_and_start_new_cycle() — sees the new values without
-    waiting on the network call below), and best-effort pushes each key
-    to this service's Render env vars so a FUTURE deploy starts from
-    them too. Mirrors restart_scheduler.trigger_redeploy()'s
-    async-task-with-sync-fallback shape.
-    """
-    for key, value in mapping.items():
-        os.environ[key] = str(value)
-
-    api_key    = getattr(config, "RENDER_API_KEY", "")
-    service_id = getattr(config, "RENDER_SERVICE_ID", "")
-    if not api_key or not service_id:
-        _warn_persistence_not_configured()
-        return
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-    }
-
-    async def _push():
-        async with aiohttp.ClientSession(headers=headers) as session:
-            for key, value in mapping.items():
-                url = f"https://api.render.com/v1/services/{service_id}/env-vars/{key}"
-                try:
-                    async with session.put(
-                        url, json={"value": str(value)},
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as resp:
-                        if resp.status in (200, 201):
-                            logger.info(f"PROFIT-CYCLE: persisted {key}={value} ✓")
-                        else:
-                            body = await resp.text()
-                            logger.error(
-                                f"PROFIT-CYCLE: failed to persist {key} — "
-                                f"HTTP {resp.status}: {body[:300]}")
-                except Exception as exc:
-                    logger.error(f"PROFIT-CYCLE: error persisting {key}: {exc}")
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_push())
-    except RuntimeError:
-        # No running loop — e.g. called from main.py's synchronous boot
-        # path. Fall back to plain blocking requests, one call per key.
-        for key, value in mapping.items():
-            url = f"https://api.render.com/v1/services/{service_id}/env-vars/{key}"
-            try:
-                resp = requests.put(
-                    url, json={"value": str(value)}, headers=headers, timeout=20)
-                if resp.status_code in (200, 201):
-                    logger.info(f"PROFIT-CYCLE: persisted {key}={value} ✓ (sync)")
-                else:
-                    logger.error(
-                        f"PROFIT-CYCLE: failed to persist {key} (sync) — "
-                        f"HTTP {resp.status_code}: {resp.text[:300]}")
-            except Exception as exc:
-                logger.error(f"PROFIT-CYCLE: error persisting {key} (sync): {exc}")
-
-
-# ── State loading ────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    phase = os.environ.get("CYCLE_PHASE", "trading").strip().lower()
-    if phase not in ("trading", "cooldown"):
-        phase = "trading"
+def dashboard_fields(balance=None, min_stake=None) -> dict:
+    """Everything the dashboard shows about the cycle (pure read; also what the engine publishes every few seconds)."""
+    start, tp = starting_balance(), tg.target_profit()
+    with _lock:
+        st = dict(_state)
     return {
-        "phase":            phase,
-        "starting_balance": _read_float_env("CYCLE_STARTING_BALANCE", 0.0),
-        "cooldown_until":   _read_float_env("CYCLE_COOLDOWN_UNTIL", 0.0),
+        "cycle_phase": st["phase"], "cycle_message": st["message"],
+        "cycle_starting_balance": start if start > 0 else None,
+        "target_profit": tp,
+        "cycle_target_balance": tg.target_balance_for(start, tp),
+        "cycle_net_profit": tg.net_profit(balance, start) if balance is not None else None,
+        "min_stake_used": min_stake,
+        "cycle_count": cycle_count(), "lifetime_profit": lifetime_profit(),
+        "cycle_alert_persistence_missing": st["persistence_missing"],
+        "cycle_alert_clear_unverified": st["clear_unverified"],
+        "cycle_alert_redeploy_retrying": st["redeploy_retrying"],
+        "cycle_alert_drain_timeout": st["drain_timeout"],
+        "cycle_alert_idle_not_suspended": st["idle_not_suspended"],
     }
 
 
-def in_cooldown_at_boot() -> Optional[float]:
-    """Returns the cooldown_until epoch if this process booted mid-cooldown
-    (main.py must NOT start the bot / connect to Deriv in that case), or
-    None if it's clear to trade — either genuinely trading already, or a
-    cooldown that has already elapsed (this process IS the post-cooldown
-    redeploy)."""
-    state = load_state()
-    if state["phase"] == "cooldown" and state["cooldown_until"] > time.time():
-        return state["cooldown_until"]
-    return None
-
-
-def clear_cooldown_and_start_new_cycle() -> None:
-    """Called by main.py at boot when the persisted phase is 'cooldown'
-    but the deadline has already passed — i.e. this process is the
-    redeploy the cooldown supervisor thread triggered. Resets the
-    persisted state so get_or_init_starting_balance() captures a brand
-    new starting balance once bot_engine connects."""
-    logger.info("PROFIT-CYCLE: cooldown window elapsed — starting a fresh cycle")
-    _persist_env_vars({
-        "CYCLE_PHASE":            "trading",
-        "CYCLE_COOLDOWN_UNTIL":   "0",
-        "CYCLE_STARTING_BALANCE": "0",
-    })
-
-
-# ── Starting-balance capture ────────────────────────────────────────────────
-
-def get_or_init_starting_balance(current_balance: float) -> float:
-    """
-    Called once by bot_engine.run() right after connecting. If a starting
-    balance survived from before this redeploy (the normal case for the
-    rolling REDEPLOY_INTERVAL_HOURS redeploy while trading), resume it
-    unchanged so growth is tracked across the whole cycle, not reset
-    every redeploy. Otherwise (first run ever, or first run after
-    clear_cooldown_and_start_new_cycle()) capture the current balance as
-    the new cycle's baseline and persist it.
-    """
-    persisted = _read_float_env("CYCLE_STARTING_BALANCE", 0.0)
-    if persisted > 0:
-        logger.info(
-            f"PROFIT-CYCLE: resuming existing cycle — "
-            f"starting_balance=${persisted:.4f}")
-        return persisted
-
-    target_pct = getattr(config, "PROFIT_CYCLE_TARGET_PCT", 50)
-    target = current_balance * (1 + target_pct / 100.0)
-    logger.warning(
-        f"PROFIT-CYCLE: NEW cycle starting — "
-        f"starting_balance=${current_balance:.4f}, "
-        f"target=${target:.4f} (+{target_pct:.0f}%)")
-    _persist_env_vars({
-        "CYCLE_PHASE":            "trading",
-        "CYCLE_STARTING_BALANCE": f"{current_balance:.8f}",
-        "CYCLE_COOLDOWN_UNTIL":   "0",
-    })
-    _push_dashboard_flag(
-        cycle_phase="trading",
-        cycle_starting_balance=round(current_balance, 4),
-        cycle_target_balance=round(target, 4),
-    )
-    return current_balance
-
-
-# ── Target check / cooldown request (mirrors restart_scheduler.py's
-#    is_redeploy_pending() / trigger_redeploy() pending-flag pattern) ────────
-
-def check_target(current_balance: float, starting_balance: float) -> bool:
-    if starting_balance <= 0:
-        return False
-    target_pct = getattr(config, "PROFIT_CYCLE_TARGET_PCT", 50)
-    return current_balance >= starting_balance * (1 + target_pct / 100.0)
-
-
-def request_cooldown() -> None:
-    global _cooldown_requested
-    if not _cooldown_requested:
-        _cooldown_requested = True
-        logger.warning(
-            "PROFIT-CYCLE: TARGET REACHED — requesting cooldown; no new "
-            "trades will open while open contracts drain")
-        _push_dashboard_flag(cycle_target_reached=True)
-
-
-def is_cooldown_requested() -> bool:
-    return _cooldown_requested
-
-
-def is_starting_drawdown_breached(current_balance: float, starting_balance: float) -> bool:
-    """
-    Checked by bot_engine._settle_loop() ONLY at the moment the ordinary
-    rolling REDEPLOY_INTERVAL_HOURS redeploy comes due
-    (restart_scheduler.is_redeploy_pending() is True). True once
-    current_balance has fallen PROFIT_CYCLE_STARTING_DRAWDOWN_PCT (or
-    more) below this cycle's own starting_balance. When this is True the
-    rolling redeploy must NOT be allowed to go through as an ordinary
-    redeploy: the caller should request a cooldown instead (same as
-    hitting the profit target), so the bot drains and starts a brand-new
-    cycle from whatever the balance is once the cooldown elapses, rather
-    than redeploying straight back into the same losing cycle.
-    """
-    if starting_balance <= 0:
-        return False   # cycle not initialized yet — nothing to compare against
-
-    drawdown_pct = (starting_balance - current_balance) / starting_balance * 100.0
-    trigger_pct = getattr(config, "PROFIT_CYCLE_STARTING_DRAWDOWN_PCT", 25)
-    return drawdown_pct >= trigger_pct
-
-
-def enter_cooldown_now() -> float:
-    """
-    Called by bot_engine._settle_loop() ONLY once every open contract has
-    been actively, confirmably closed. Persists the cooldown window (so
-    it survives the redeploy that ends it) and starts the supervisor
-    thread that waits it out and then fires the Render deploy hook.
-    Returns the cooldown_until epoch.
-    """
-    global _cooldown_requested
-
-    cooldown_mins  = getattr(config, "PROFIT_CYCLE_COOLDOWN_MINUTES", 17)
-    cooldown_until = time.time() + cooldown_mins * 60
-
-    _persist_env_vars({
-        "CYCLE_PHASE":            "cooldown",
-        "CYCLE_COOLDOWN_UNTIL":   f"{cooldown_until:.0f}",
-        # Cleared now so that if this exact process somehow reconnects
-        # before the redeploy fires, get_or_init_starting_balance() still
-        # treats the next connect as a fresh cycle rather than resuming
-        # the just-completed one.
-        "CYCLE_STARTING_BALANCE": "0",
-    })
-    _cooldown_requested = False
-    _push_dashboard_flag(
-        cycle_phase="cooldown",
-        cycle_cooldown_until=cooldown_until,
-        cycle_target_reached=False,
-    )
-    start_cooldown_supervisor(cooldown_until)
-    return cooldown_until
-
-
-# ── Cooldown supervisor — dedicated thread, deliberately NOT tied to the
-#    bot's asyncio event loop (that loop is torn down the moment run()
-#    returns and asyncio.run() in main.py's _run_bot() exits, which would
-#    kill a task scheduled on it). Plain blocking sleep + one HTTP POST,
-#    same idea as restart_scheduler.start_restart_scheduler()'s
-#    dedicated-thread fallback. ───────────────────────────────────────────
-
-def _fire_deploy_hook() -> None:
-    hook_url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "") or \
-        getattr(config, "RENDER_DEPLOY_HOOK_URL", "")
-
-    while not hook_url:
-        logger.critical(
-            "\n" + "=" * 78 + "\n"
-            "COOLDOWN OVER BUT RENDER_DEPLOY_HOOK_URL IS NOT SET\n"
-            "Cannot redeploy to resume trading. Add it in the Render "
-            "dashboard — doing so restarts this service itself, which "
-            "will pick the new cycle up from there. Rechecking every "
-            "5 min.\n" + "=" * 78
-        )
-        _push_dashboard_flag(cycle_redeploy_hook_missing=True)
-        time.sleep(300)
-        hook_url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "") or \
-            getattr(config, "RENDER_DEPLOY_HOOK_URL", "")
-
-    try:
-        resp = requests.post(hook_url, timeout=20)
-        if resp.status_code in (200, 201, 202):
-            logger.info(f"PROFIT-CYCLE: redeploy hook fired ✓ HTTP {resp.status_code}")
-            _push_dashboard_flag(cycle_redeploy_hook_missing=False)
-        else:
-            logger.error(
-                f"PROFIT-CYCLE: redeploy hook FAILED — HTTP "
-                f"{resp.status_code}: {resp.text[:300]}")
-    except Exception as exc:
-        logger.error(f"PROFIT-CYCLE: redeploy hook ERROR: {exc}")
-
-
-def _cooldown_supervisor_thread(cooldown_until: float) -> None:
-    remaining = cooldown_until - time.time()
-    logger.warning(
-        f"PROFIT-CYCLE COOLDOWN: NOT connecting to Deriv for the next "
-        f"{max(0.0, remaining) / 60:.1f} min — health checks only, "
-        f"staying alive on Render via the self-ping thread")
-
-    next_log_at = 0.0
-    while True:
-        now       = time.time()
-        remaining = cooldown_until - now
-        _push_dashboard_flag(
-            cycle_phase="cooldown",
-            cycle_cooldown_remaining_secs=max(0, int(remaining)),
-        )
-        if remaining <= 0:
-            break
-        if now >= next_log_at:
-            logger.info(f"PROFIT-CYCLE COOLDOWN: {remaining / 60:.1f} min remaining")
-            next_log_at = now + 60
-        time.sleep(min(5.0, max(0.1, remaining)))
-
-    logger.warning(
-        "PROFIT-CYCLE COOLDOWN COMPLETE — firing Render deploy hook to "
-        "resume trading")
-    _fire_deploy_hook()
-
-
-def start_cooldown_supervisor(cooldown_until: float) -> None:
-    t = threading.Thread(
-        target=_cooldown_supervisor_thread,
-        args=(cooldown_until,),
-        name="profit-cycle-cooldown",
-        daemon=True,
-    )
-    t.start()
+def publish(balance=None, min_stake=None) -> None:
+    _push(**dashboard_fields(balance, min_stake))
