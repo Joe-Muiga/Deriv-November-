@@ -1,0 +1,39 @@
+{
+  "shared": {
+    "stake": "0.35",
+    "target": "1",
+    "mode": "real",
+    "branch": "main"
+  },
+  "services": [
+    {
+      "name": "bot-oregon",
+      "region": "oregon",
+      "render_api_key": "PASTE_RENDER_KEY_1",
+      "deriv_app_id": "PASTE_APP_ID_1",
+      "deriv_token": "PASTE_TOKEN_1"
+    },
+    {
+      "name": "bot-frankfurt",
+      "region": "frankfurt",
+      "render_api_key": "PASTE_RENDER_KEY_2",
+      "deriv_app_id": "PASTE_APP_ID_2",
+      "deriv_token": "PASTE_TOKEN_2"
+    },
+    {
+      "name": "bot-singapore",
+      "region": "singapore",
+      "render_api_key": "PASTE_RENDER_KEY_3",
+      "deriv_app_id": "PASTE_APP_ID_3",
+      "deriv_token": "PASTE_TOKEN_3"
+    },
+    {
+      "name": "bot-ohio",
+      "region": "ohio",
+      "render_api_key": "PASTE_RENDER_KEY_4",
+      "deriv_app_id": "PASTE_APP_ID_4",
+      "deriv_token": "PASTE_TOKEN_4",
+      "stake": "0.5"
+    }
+  ]
+}
