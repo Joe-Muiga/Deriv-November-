@@ -133,3 +133,4 @@ services:
       #   CYCLE_COUNT / CYCLE_LIFETIME_PROFIT / CYCLE_STARTING_BALANCE - the bot writes these itself;
       #       listing them here would reset your cycle on every sync.
       #   TARGET_BALANCE - deprecated, ignored by the bot.
+ 
