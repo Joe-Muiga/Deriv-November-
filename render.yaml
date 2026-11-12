@@ -88,11 +88,48 @@ services:
     startCommand: python main.py
 
     envVars:
+      # ── You paste ONLY these values in Render (names are created automatically) ──
       - key: DERIV_API_TOKEN
         sync: false
-      - key: RENDER_API_KEY       # required: saves/clears the cycle's starting balance, redeploys on the profit target, suspends on low balance
+      - key: DERIV_APP_ID
         sync: false
-      - key: PREDICTOR_STAKE      # MINIMUM stake for the main account AND the followers (money rules size up from it)
+      - key: RENDER_API_KEY
         sync: false
-      - key: TARGET_PROFIT        # SET BY HAND (profit per cycle, e.g. 50). The bot only READS it - it never writes or clears it.
+
+      # ── Name is created automatically; the value you type in Render ALWAYS wins (the file never overwrites it) ──
+      - key: PREDICTOR_STAKE
         sync: false
+      - key: TARGET_PROFIT
+        sync: false
+
+      # ── Filled in automatically from this file ──
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DERIV_ACCOUNT_MODE
+        value: real
+      - key: SET_ALLOW_REAL
+        value: "1"
+      - key: SESSION_SCHEDULE_ENABLED
+        value: "0"
+      - key: MH_GATE
+        value: "0"
+      - key: MH_INVERT
+        value: "1"
+      - key: MH_MIN_EDGE
+        value: "-1"
+      - key: MH_MIN_PAYOUT_RATIO
+        value: "2"
+      - key: MH_OOS_CHECK
+        value: "0"
+      - key: MH_PRED_V2
+        value: "1"
+      - key: MH_RANK_KEY
+        value: edge
+      - key: V2_ACT_ON_NO_STRUCTURE
+        value: "1"
+
+      # NOT listed on purpose:
+      #   RENDER_SERVICE_ID - Render sets it by itself when the service runs; listing it blank could hide that value.
+      #   CYCLE_COUNT / CYCLE_LIFETIME_PROFIT / CYCLE_STARTING_BALANCE - the bot writes these itself;
+      #       listing them here would reset your cycle on every sync.
+      #   TARGET_BALANCE - deprecated, ignored by the bot.
